@@ -16,19 +16,23 @@ package validation
 
 import (
 	"bytes"
-	"crypto/tls"
 	"fmt"
 	"io/ioutil"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/ghodss/yaml"
 	"github.com/onsi/gomega"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 
 	"istio.io/istio/pkg/mcp/testing/testcerts"
 )
@@ -36,20 +40,267 @@ import (
 var (
 	failurePolicyFailVal = admissionregistrationv1beta1.Fail
 	failurePolicyFail    = &failurePolicyFailVal
+
+	failurePolicyIgnoreVal = admissionregistrationv1beta1.Ignore
+	failurePolicyIgnore    = &failurePolicyIgnoreVal
 )
 
+func createTestWebhookConfigController(
+	t testing.TB,
+	cl clientset.Interface,
+	fakeWebhookSource cache.ListerWatcher,
+	config *admissionregistrationv1beta1.ValidatingWebhookConfiguration) (*WebhookConfigController, func()) {
+
+	t.Helper()
+	dir, err := ioutil.TempDir("", "galley_validation_webhook")
+	if err != nil {
+		t.Fatalf("TempDir() failed: %v", err)
+	}
+	cleanup := func() {
+		os.RemoveAll(dir) // nolint: errcheck
+	}
+
+	var (
+		certFile   = filepath.Join(dir, "cert-file.yaml")
+		keyFile    = filepath.Join(dir, "key-file.yaml")
+		caFile     = filepath.Join(dir, "ca-file.yaml")
+		configFile = filepath.Join(dir, "config-file.yaml")
+		port       = uint(0)
+	)
+
+	// cert
+	if err := ioutil.WriteFile(certFile, testcerts.ServerCert, 0644); err != nil { // nolint: vetshadow
+		cleanup()
+		t.Fatalf("WriteFile(%v) failed: %v", certFile, err)
+	}
+	// key
+	if err := ioutil.WriteFile(keyFile, testcerts.ServerKey, 0644); err != nil { // nolint: vetshadow
+		cleanup()
+		t.Fatalf("WriteFile(%v) failed: %v", keyFile, err)
+	}
+	// ca
+	if err := ioutil.WriteFile(caFile, testcerts.CACert, 0644); err != nil { // nolint: vetshadow
+		cleanup()
+		t.Fatalf("WriteFile(%v) failed: %v", caFile, err)
+	}
+
+	configBytes, err := yaml.Marshal(&config)
+	if err != nil {
+		cleanup()
+		t.Fatalf("could not create fake webhook configuration data: %v", err)
+	}
+	if err := ioutil.WriteFile(configFile, configBytes, 0644); err != nil { // nolint: vetshadow
+		cleanup()
+		t.Fatalf("WriteFile(%v) failed: %v", configFile, err)
+	}
+
+	options := WebhookParameters{
+		CertFile:                      certFile,
+		KeyFile:                       keyFile,
+		Port:                          port,
+		DomainSuffix:                  testDomainSuffix,
+		WebhookConfigFile:             configFile,
+		CACertFile:                    caFile,
+		Clientset:                     cl,
+		WebhookName:                   config.Name,
+		DeploymentName:                dummyNamespace.Name,
+		ServiceName:                   dummyNamespace.Name,
+		DeploymentAndServiceNamespace: dummyNamespace.Namespace,
+	}
+	whc, err := NewWebhookConfigController(options)
+	if err != nil {
+		cleanup()
+		t.Fatalf("NewWebhookConfigController() failed: %v", err)
+	}
+
+	whc.createInformerWebhookSource = func(cl clientset.Interface, name string) cache.ListerWatcher {
+		return fakeWebhookSource
+	}
+
+	return whc, func() {
+		cleanup()
+	}
+}
+
 func TestValidatingWebhookConfig(t *testing.T) {
-	want := &admissionregistrationv1beta1.ValidatingWebhookConfiguration{
+	want := initValidatingWebhookConfiguration()
+
+	missingDefaults := want.DeepCopyObject().(*admissionregistrationv1beta1.ValidatingWebhookConfiguration)
+	missingDefaults.Webhooks[0].NamespaceSelector = nil
+	missingDefaults.Webhooks[0].FailurePolicy = nil
+
+	ts := []struct {
+		name    string
+		configs admissionregistrationv1beta1.ValidatingWebhookConfigurationList
+		desired *admissionregistrationv1beta1.ValidatingWebhookConfiguration
+		updated bool
+	}{
+		{
+			name:    "WebhookConfigNotFound",
+			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{},
+			updated: true,
+		},
+		{
+			name: "WebhookEntryNotFound",
+			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
+				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "config1",
+						},
+					},
+				},
+			},
+			desired: want,
+			updated: true,
+		},
+		{
+			name: "SuccessfullyPatched",
+			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
+				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "config1",
+						},
+						Webhooks: []admissionregistrationv1beta1.ValidatingWebhook{
+							{
+								Name:         "webhook1",
+								ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{},
+							},
+						},
+					},
+				},
+			},
+			desired: want,
+			updated: true,
+		},
+		{
+			name: "MultipleWebhookEntryNotFound",
+			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
+				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "config1",
+						},
+						Webhooks: []admissionregistrationv1beta1.ValidatingWebhook{
+							{
+								Name:         "webhook1",
+								ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{},
+							},
+						},
+					},
+				},
+			},
+			desired: want,
+			updated: true,
+		},
+		{
+			name: "MultipleSuccessfullyPatched",
+			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
+				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "config1",
+						},
+						Webhooks: []admissionregistrationv1beta1.ValidatingWebhook{
+							{
+								Name:         "webhook1",
+								ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{},
+							},
+							{
+								Name:         "webhook2",
+								ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{},
+							},
+						},
+					},
+				},
+			},
+			desired: want,
+			updated: true,
+		},
+		{
+			name: "No change",
+			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
+				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{*want},
+			},
+			desired: want,
+			updated: false,
+		},
+		{
+			name: "No change with missing defaults",
+			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
+				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{*want},
+			},
+			desired: missingDefaults,
+			updated: false,
+		},
+	}
+
+	for _, tc := range ts {
+		t.Run(tc.name, func(t *testing.T) {
+			whc, cancel := createTestWebhookConfigController(t,
+				fake.NewSimpleClientset(dummyNamespace, tc.configs.DeepCopyObject()),
+				createFakeWebhookSource(), want)
+			defer cancel()
+
+			client := fake.NewSimpleClientset(tc.configs.DeepCopyObject())
+			config, err := rebuildWebhookConfigHelper(whc.webhookParameters.CACertFile,
+				whc.webhookParameters.WebhookConfigFile, whc.webhookParameters.WebhookName, whc.ownerRefs)
+			if err != nil {
+				t.Fatalf("Got unexpected error: %v", err)
+			}
+
+			// not set by create/update
+			config.Name = want.Name
+
+			validateClient := client.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations()
+			updated, err := createOrUpdateWebhookConfigHelper(validateClient, config)
+			if err != nil {
+				t.Fatalf("createOrUpdateWebhookConfigHelper failed: %v", err)
+			}
+
+			if tc.updated != updated {
+				t.Fatalf("incorrect config update: got %v want %v", updated, tc.updated)
+			}
+
+			if tc.updated {
+				wantActions := 2
+				actions := client.Actions()
+				if len(actions) != wantActions {
+					t.Fatalf("unexpected number of k8s actions: got %v want %v", len(actions), wantActions)
+				}
+
+				switch action := actions[1].(type) {
+				case k8stesting.UpdateActionImpl:
+					got := action.GetObject().(*admissionregistrationv1beta1.ValidatingWebhookConfiguration)
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("Got incorrect update webhook configuration: \ngot %#v \nwant %#v",
+							got, want)
+					}
+				case k8stesting.CreateActionImpl:
+					got := action.GetObject().(*admissionregistrationv1beta1.ValidatingWebhookConfiguration)
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("Got incorrect create webhook configuration: \ngot %#v \nwant %#v",
+							got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func initValidatingWebhookConfiguration() *admissionregistrationv1beta1.ValidatingWebhookConfiguration {
+	return &admissionregistrationv1beta1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "config1",
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(
-					dummyDeployment,
-					extensionsv1beta1.SchemeGroupVersion.WithKind("Deployment"),
+					dummyNamespace,
+					corev1.SchemeGroupVersion.WithKind("Namespace"),
 				),
 			},
 		},
-		Webhooks: []admissionregistrationv1beta1.Webhook{
+		Webhooks: []admissionregistrationv1beta1.ValidatingWebhook{
 			{
 				Name: "hook-foo",
 				ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{
@@ -67,7 +318,7 @@ func TestValidatingWebhookConfig(t *testing.T) {
 						},
 						Rule: admissionregistrationv1beta1.Rule{
 							APIGroups:   []string{"g1"},
-							APIVersions: []string{"v1"},
+							APIVersions: []string{"corev1"},
 							Resources:   []string{"r1"},
 						},
 					},
@@ -124,208 +375,80 @@ func TestValidatingWebhookConfig(t *testing.T) {
 			},
 		},
 	}
-
-	missingDefaults := want.DeepCopyObject().(*admissionregistrationv1beta1.ValidatingWebhookConfiguration)
-	missingDefaults.Webhooks[0].NamespaceSelector = nil
-	missingDefaults.Webhooks[0].FailurePolicy = nil
-
-	ts := []struct {
-		name    string
-		configs admissionregistrationv1beta1.ValidatingWebhookConfigurationList
-		desired *admissionregistrationv1beta1.ValidatingWebhookConfiguration
-		updated bool
-	}{
-		{
-			name:    "WebhookConfigNotFound",
-			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{},
-			updated: true,
-		},
-		{
-			name: "WebhookEntryNotFound",
-			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
-				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "config1",
-						},
-					},
-				},
-			},
-			desired: want,
-			updated: true,
-		},
-		{
-			name: "SuccessfullyPatched",
-			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
-				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "config1",
-						},
-						Webhooks: []admissionregistrationv1beta1.Webhook{
-							{
-								Name:         "webhook1",
-								ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{},
-							},
-						},
-					},
-				},
-			},
-			desired: want,
-			updated: true,
-		},
-		{
-			name: "MultipleWebhookEntryNotFound",
-			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
-				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "config1",
-						},
-						Webhooks: []admissionregistrationv1beta1.Webhook{
-							{
-								Name:         "webhook1",
-								ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{},
-							},
-						},
-					},
-				},
-			},
-			desired: want,
-			updated: true,
-		},
-		{
-			name: "MultipleSuccessfullyPatched",
-			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
-				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "config1",
-						},
-						Webhooks: []admissionregistrationv1beta1.Webhook{
-							{
-								Name:         "webhook1",
-								ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{},
-							},
-							{
-								Name:         "webhook2",
-								ClientConfig: admissionregistrationv1beta1.WebhookClientConfig{},
-							},
-						},
-					},
-				},
-			},
-			desired: want,
-			updated: true,
-		},
-		{
-			name: "No change",
-			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
-				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{*want},
-			},
-			desired: want,
-			updated: false,
-		},
-		{
-			name: "No change with missing defaults",
-			configs: admissionregistrationv1beta1.ValidatingWebhookConfigurationList{
-				Items: []admissionregistrationv1beta1.ValidatingWebhookConfiguration{*want},
-			},
-			desired: missingDefaults,
-			updated: false,
-		},
-	}
-
-	for _, tc := range ts {
-		t.Run(tc.name, func(t *testing.T) {
-			wh, cancel := createTestWebhook(t,
-				fake.NewSimpleClientset(dummyDeployment, tc.configs.DeepCopyObject()),
-				createFakeWebhookSource(),
-				createFakeEndpointsSource(),
-				want)
-			defer cancel()
-
-			client := fake.NewSimpleClientset(tc.configs.DeepCopyObject())
-			config, err := rebuildWebhookConfigHelper(wh.caFile, wh.webhookConfigFile, wh.webhookName, wh.ownerRefs)
-			if err != nil {
-				t.Fatalf("Got unexpected error: %v", err)
-			}
-
-			// not set by create/update
-			config.Name = want.Name
-
-			validateClient := client.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations()
-			updated, err := createOrUpdateWebhookConfigHelper(validateClient, config)
-			if err != nil {
-				t.Fatalf("createOrUpdateWebhookConfigHelper failed: %v", err)
-			}
-
-			if tc.updated != updated {
-				t.Fatalf("incorrect config update: got %v want %v", updated, tc.updated)
-			}
-
-			if tc.updated {
-				wantActions := 2
-				actions := client.Actions()
-				if len(actions) != wantActions {
-					t.Fatalf("unexpected number of k8s actions: got %v want %v", len(actions), wantActions)
-				}
-
-				switch action := actions[1].(type) {
-				case k8stesting.UpdateActionImpl:
-					got := action.GetObject().(*admissionregistrationv1beta1.ValidatingWebhookConfiguration)
-					if !reflect.DeepEqual(got, want) {
-						t.Fatalf("Got incorrect update webhook configuration: \ngot %#v \nwant %#v",
-							got, want)
-					}
-				case k8stesting.CreateActionImpl:
-					got := action.GetObject().(*admissionregistrationv1beta1.ValidatingWebhookConfiguration)
-					if !reflect.DeepEqual(got, want) {
-						t.Fatalf("Got incorrect create webhook configuration: \ngot %#v \nwant %#v",
-							got, want)
-					}
-				}
-			}
-		})
-	}
 }
 
-func checkCert(t *testing.T, wh *Webhook, cert, key []byte) bool {
-	t.Helper()
-	actual, err := wh.getCert(nil)
-	if err != nil {
-		t.Fatalf("fail to get certificate from webhook: %s", err)
-	}
-	expected, err := tls.X509KeyPair(cert, key)
-	if err != nil {
-		t.Fatalf("fail to load test certs.")
-	}
-	return bytes.Equal(actual.Certificate[0], expected.Certificate[0])
+func TestDeleteValidatingWebhookConfig(t *testing.T) {
+
+	initConfig := initValidatingWebhookConfiguration()
+
+	t.Run("WebhookConfigDeleted", func(t *testing.T) {
+
+		client := fake.NewSimpleClientset(initConfig)
+		whc, cancel := createTestWebhookConfigController(t,
+			client,
+			createFakeWebhookSource(),
+			initConfig)
+		defer cancel()
+
+		_, err := rebuildWebhookConfigHelper(whc.webhookParameters.CACertFile, whc.webhookParameters.WebhookConfigFile,
+			whc.webhookParameters.WebhookName, whc.ownerRefs)
+		if err != nil {
+			t.Fatalf("Got unexpected error: %v", err)
+		}
+
+		validateClient := client.AdmissionregistrationV1beta1().ValidatingWebhookConfigurations()
+		//delete the webhook config
+		whc.deleteWebhookConfig()
+		//delete webhook config again to test
+		deleted, err := deleteWebhookConfigHelper(validateClient, whc.webhookParameters.WebhookName)
+		if err != nil {
+			t.Fatalf("Delete ValidatingWebhookConfigure failed: %v", err)
+		}
+		if deleted {
+			t.Errorf("Delete ValidatingWebhookConfigure failed in the first time")
+		}
+	})
 }
 
-func TestReloadCert(t *testing.T) {
-	wh, cleanup := createTestWebhook(t,
+func TestReloadConfig(t *testing.T) {
+	whc, cleanup := createTestWebhookConfigController(t,
 		fake.NewSimpleClientset(),
 		createFakeWebhookSource(),
-		createFakeEndpointsSource(),
 		dummyConfig)
 	defer cleanup()
 	stop := make(chan struct{})
 	defer func() { close(stop) }()
-	go wh.Run(stop)
-	checkCert(t, wh, testcerts.ServerCert, testcerts.ServerKey)
-	// Update cert/key files.
-	if err := ioutil.WriteFile(wh.certFile, testcerts.RotatedCert, 0644); err != nil { // nolint: vetshadow
-		cleanup()
-		t.Fatalf("WriteFile(%v) failed: %v", wh.certFile, err)
-	}
-	if err := ioutil.WriteFile(wh.keyFile, testcerts.RotatedKey, 0644); err != nil { // nolint: vetshadow
-		cleanup()
-		t.Fatalf("WriteFile(%v) failed: %v", wh.keyFile, err)
-	}
+	go whc.reconcile(stop)
+
 	g := gomega.NewGomegaWithT(t)
+
 	g.Eventually(func() bool {
-		return checkCert(t, wh, testcerts.RotatedCert, testcerts.RotatedKey)
+		if whc.webhookConfiguration == nil {
+			return false
+		}
+		return *whc.webhookConfiguration.Webhooks[0].FailurePolicy == failurePolicyFailVal
+	}, "10s", "100ms").Should(gomega.BeTrue())
+
+	updatedConfig := dummyConfig.DeepCopy()
+	updatedConfig.Webhooks[0].FailurePolicy = failurePolicyIgnore
+	updatedConfigBytes, err := yaml.Marshal(&updatedConfig)
+	if err != nil {
+		t.Fatalf("failed to create updated webhook config: %v", err)
+	}
+
+	// Update cert/key files.
+	if err := ioutil.WriteFile(whc.webhookParameters.CACertFile, testcerts.RotatedCert, 0644); err != nil { // nolint: vetshadow
+		cleanup()
+		t.Fatalf("WriteFile(%v) failed: %v", whc.webhookParameters.CertFile, err)
+	}
+	if err := ioutil.WriteFile(whc.webhookParameters.WebhookConfigFile, updatedConfigBytes, 0644); err != nil { // nolint: vetshadow
+		cleanup()
+		t.Fatalf("WriteFile(%v) failed: %v", whc.webhookParameters.KeyFile, err)
+	}
+
+	// wait for config to update
+	g.Eventually(func() bool {
+		return *whc.webhookConfiguration.Webhooks[0].FailurePolicy == failurePolicyIgnoreVal
 	}, "10s", "100ms").Should(gomega.BeTrue())
 }
 
@@ -383,16 +506,15 @@ func TestInitialConfigLoadError(t *testing.T) {
 		}
 	}()
 
-	wh, cleanup := createTestWebhook(t,
+	whc, cleanup := createTestWebhookConfigController(t,
 		fake.NewSimpleClientset(),
 		createFakeWebhookSource(),
-		createFakeEndpointsSource(),
 		dummyConfig)
 	defer cleanup()
 
-	wh.webhookConfigFile = ""
-	wh.webhookConfiguration = nil
-	if err := wh.rebuildWebhookConfig(); err == nil {
+	whc.webhookParameters.WebhookConfigFile = ""
+	whc.webhookConfiguration = nil
+	if err := whc.rebuildWebhookConfig(); err == nil {
 		t.Fatal("unexpected success: rebuildWebhookConfig() should have failed given invalid config files")
 	}
 }

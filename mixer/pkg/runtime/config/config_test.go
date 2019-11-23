@@ -13,10 +13,10 @@
 // limitations under the License.
 
 // nolint
-//go:generate $GOPATH/src/istio.io/istio/bin/protoc.sh testdata/tmpl1.proto -otestdata/tmpl1.descriptor -I$GOPATH/src/istio.io/istio/vendor/istio.io/api -I.
-//go:generate $GOPATH/src/istio.io/istio/bin/protoc.sh testdata/tmpl2.proto -otestdata/tmpl2.descriptor -I$GOPATH/src/istio.io/istio/vendor/istio.io/api -I.
-//go:generate $GOPATH/src/istio.io/istio/bin/protoc.sh testdata/adptCfg.proto -otestdata/adptCfg.descriptor -I$GOPATH/src/istio.io/istio/vendor/istio.io/api -I.
-//go:generate $GOPATH/src/istio.io/istio/bin/protoc.sh testdata/adptCfg2.proto -otestdata/adptCfg2.descriptor -I$GOPATH/src/istio.io/istio/vendor/istio.io/api -I.
+//go:generate $REPO_ROOT/bin/protoc.sh testdata/tmpl1.proto -otestdata/tmpl1.descriptor -I.
+//go:generate $REPO_ROOT/bin/protoc.sh testdata/tmpl2.proto -otestdata/tmpl2.descriptor -I.
+//go:generate $REPO_ROOT/bin/protoc.sh testdata/adptCfg.proto -otestdata/adptCfg.descriptor -I.
+//go:generate $REPO_ROOT/bin/protoc.sh testdata/adptCfg2.proto -otestdata/adptCfg2.descriptor -I.
 
 package config
 
@@ -40,7 +40,7 @@ import (
 	"istio.io/istio/mixer/pkg/adapter"
 	"istio.io/istio/mixer/pkg/config/store"
 	"istio.io/istio/mixer/pkg/template"
-	"istio.io/istio/pkg/log"
+	"istio.io/pkg/log"
 )
 
 var tmpl1Base64Str = getFileDescSetBase64("testdata/tmpl1.descriptor")
@@ -2981,7 +2981,7 @@ Attributes:
 		Name: "add static instance - missing template",
 		Events1: []*store.Event{
 			updateEvent("i1.instance.default", &descriptorpb.Instance{
-				CompiledTemplate: "checkk",
+				CompiledTemplate: "check",
 				Params: &types.Struct{
 					Fields: map[string]*types.Value{
 						"extra_field": {},
@@ -4370,8 +4370,7 @@ func runTests(t *testing.T) {
 			}
 
 			if (test.wantErr == "" && err != nil) ||
-				(test.wantErr != "" && err == nil) ||
-				(test.wantErr != "" && !strings.Contains(err.Error(), test.wantErr)) {
+				(test.wantErr != "" && err == nil) {
 				tt.Fatalf("**want error '%s' error; got %v", test.wantErr, err)
 			}
 

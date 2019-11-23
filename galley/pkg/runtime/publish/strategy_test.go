@@ -68,7 +68,7 @@ func TestStrategy_OnTimer(t *testing.T) {
 	default:
 	}
 	if published {
-		t.Fatal("strategy shouldn't have signalled to publish")
+		t.Fatal("strategy shouldn't have signaled to publish")
 	}
 }
 
@@ -96,7 +96,7 @@ func TestStrategy_OnTimer_Quiesce(t *testing.T) {
 	default:
 	}
 	if !published {
-		t.Fatal("strategy should have signalled to publish")
+		t.Fatal("strategy should have signaled to publish")
 	}
 }
 
@@ -126,7 +126,7 @@ func TestStrategy_OnTimer_MaxTimeout(t *testing.T) {
 		default:
 		}
 		if published {
-			t.Fatal("strategy should have not signalled to publish")
+			t.Fatal("strategy should have not signaled to publish")
 		}
 
 	}
@@ -142,19 +142,17 @@ func TestStrategy_OnTimer_MaxTimeout(t *testing.T) {
 	default:
 	}
 	if !published {
-		t.Fatal("strategy should have signalled to publish")
+		t.Fatal("strategy should have signaled to publish")
 	}
 }
 
-func TestStrategy_Close(t *testing.T) {
+func TestStrategy_CloseTwice(t *testing.T) {
 	s := NewStrategyWithDefaults()
 
 	s.OnChange()
 
 	s.Close()
-	if !s.stopped {
-		t.Fatal("timer should have been stopped")
-	}
+
 	// Should not crash.
 	s.Close()
 }

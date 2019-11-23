@@ -34,7 +34,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"istio.io/istio/mixer/pkg/config/store"
-	"istio.io/istio/pkg/probe"
+	"istio.io/pkg/probe"
 )
 
 // The "retryTimeout" used by the test.
@@ -155,7 +155,7 @@ func getTempClient() (*Store, string, *dummyListerWatcherBuilder) {
 			return lw, nil
 		},
 		Probe:         probe.NewProbe(),
-		retryInterval: 0,
+		retryInterval: 1 * time.Millisecond,
 	}
 	return client, ns, lw
 }
@@ -320,9 +320,6 @@ func TestCriticalCrdsAreReady(t *testing.T) {
 		fakeDiscovery.Resources[0].APIResources = append(
 			fakeDiscovery.Resources[0].APIResources,
 			metav1.APIResource{Name: "handlers", SingularName: "handler", Kind: "Handler", Namespaced: true},
-		)
-		fakeDiscovery.Resources[0].APIResources = append(
-			fakeDiscovery.Resources[0].APIResources,
 			metav1.APIResource{Name: "actions", SingularName: "action", Kind: "Action", Namespaced: true},
 		)
 		return true, nil, nil
@@ -474,7 +471,7 @@ func TestCrdsRetryAsynchronously(t *testing.T) {
 	}
 	atomic.StoreInt32(&count, 1)
 
-	after := time.After(time.Second / 10)
+	after := time.After(time.Second)
 	tick := time.Tick(time.Millisecond)
 loop:
 	for {
@@ -528,13 +525,13 @@ func TestCrdsRetryAsynchronouslyStoreClose(t *testing.T) {
 	s.Init([]string{"Handler", "Action"})
 
 	// Close store, which should shut down the background retry.
-	// With 10ms retry interval and 30ms before shutdown, at most 4 discovery calls would be made.
+	// With 10ms retry interval and 30ms before shutdown, at most 5 discovery calls would be made.
 	time.Sleep(30 * time.Millisecond)
 	s.Stop()
 	time.Sleep(30 * time.Millisecond)
 	mutex.RLock()
-	if callCount > 4 {
-		t.Errorf("got %v, want no more than 4 calls", callCount)
+	if callCount > 5 {
+		t.Errorf("got %v, want no more than 5 calls", callCount)
 	}
 	mutex.RUnlock()
 }

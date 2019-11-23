@@ -18,6 +18,7 @@ import (
 	"errors"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config/schema"
 )
 
 type controller struct {
@@ -45,11 +46,19 @@ func (c *controller) HasSynced() bool {
 	return true
 }
 
+func (c *controller) Version() string {
+	return c.configStore.Version()
+}
+
+func (c *controller) GetResourceAtVersion(version string, key string) (resourceVersion string, err error) {
+	return c.configStore.GetResourceAtVersion(version, key)
+}
+
 func (c *controller) Run(stop <-chan struct{}) {
 	c.monitor.Run(stop)
 }
 
-func (c *controller) ConfigDescriptor() model.ConfigDescriptor {
+func (c *controller) ConfigDescriptor() schema.Set {
 	return c.configStore.ConfigDescriptor()
 }
 

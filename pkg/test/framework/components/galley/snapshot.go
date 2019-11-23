@@ -24,6 +24,8 @@ import (
 	"github.com/pmezard/go-difflib/difflib"
 
 	mcp "istio.io/api/mcp/v1alpha1"
+
+	"istio.io/istio/galley/pkg/config/resource"
 )
 
 // Ensure that Object can behave as a proto message.
@@ -45,18 +47,33 @@ type SnapshotValidatorFunc func(actuals []*SnapshotObject) error
 
 // NewSingleObjectSnapshotValidator creates a SnapshotValidatorFunc that ensures only a single object
 // is found in the snapshot.
-func NewSingleObjectSnapshotValidator(fn func(actual *SnapshotObject) error) SnapshotValidatorFunc {
+func NewSingleObjectSnapshotValidator(ns string, fn func(ns string, actual *SnapshotObject) error) SnapshotValidatorFunc {
 	return func(actuals []*SnapshotObject) error {
-		if len(actuals) != 1 {
+		filteredActuals := getForNamespace(ns, actuals)
+		if len(filteredActuals) != 1 {
 			return fmt.Errorf("expected 1 resource, found %d", len(actuals))
 		}
-		return fn(actuals[0])
+		return fn(ns, filteredActuals[0])
 	}
+}
+
+func getForNamespace(ns string, actuals []*SnapshotObject) (result []*SnapshotObject) {
+	for _, a := range actuals {
+		fullName, err := resource.NewFullName(a.Metadata.Name)
+		if err != nil {
+			continue
+		}
+		namespace, _ := fullName.InterpretAsNamespaceAndName()
+		if ns == namespace {
+			result = append(result, a)
+		}
+	}
+	return result
 }
 
 // NewGoldenSnapshotValidator creates a SnapshotValidatorFunc that tests for equivalence against
 // a set of golden object.
-func NewGoldenSnapshotValidator(goldens []map[string]interface{}) SnapshotValidatorFunc {
+func NewGoldenSnapshotValidator(ns string, goldens []map[string]interface{}) SnapshotValidatorFunc {
 	return func(actuals []*SnapshotObject) error {
 		// Convert goldens to a map of JSON objects indexed by name.
 		goldenMap := make(map[string]interface{})
@@ -71,10 +88,6 @@ func NewGoldenSnapshotValidator(goldens []map[string]interface{}) SnapshotValida
 		// Convert actuals to a map of JSON objects indexed by name
 		actualMap := make(map[string]interface{})
 		for _, a := range actuals {
-			// Exclude ephemeral fields from comparison
-			a.Metadata.CreateTime = nil
-			a.Metadata.Version = ""
-
 			b, err := json.Marshal(a)
 			if err != nil {
 				return err
@@ -83,7 +96,10 @@ func NewGoldenSnapshotValidator(goldens []map[string]interface{}) SnapshotValida
 			if err = json.Unmarshal(b, &o); err != nil {
 				return err
 			}
-
+			meta := o["Metadata"].(map[string]interface{})
+			// Exclude ephemeral fields from comparison
+			delete(meta, "create_time")
+			delete(meta, "version")
 			name := a.Metadata.Name
 			actualMap[name] = o
 		}
@@ -135,7 +151,7 @@ func NewGoldenSnapshotValidator(goldens []map[string]interface{}) SnapshotValida
 				if er != nil {
 					return er
 				}
-				err = multierror.Append(err, fmt.Errorf("expected resource not found: %s\n%v", name, js))
+				err = multierror.Append(err, fmt.Errorf("expected resource not found: %s\n%v", name, string(js)))
 				continue
 			}
 		}

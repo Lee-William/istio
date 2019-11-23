@@ -22,15 +22,16 @@ import (
 
 	"github.com/gogo/protobuf/types"
 
+	"istio.io/pkg/log"
+	"istio.io/pkg/timedfn"
+
+	"istio.io/istio/galley/pkg/config/processor/groups"
 	"istio.io/istio/galley/pkg/meshconfig"
-	"istio.io/istio/galley/pkg/runtime/groups"
 	runtimeLog "istio.io/istio/galley/pkg/runtime/log"
 	"istio.io/istio/galley/pkg/runtime/publish"
 	"istio.io/istio/galley/pkg/runtime/resource"
 	"istio.io/istio/galley/pkg/testing/resources"
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/mcp/snapshot"
-	"istio.io/istio/pkg/util/wait"
 )
 
 const (
@@ -71,7 +72,10 @@ func TestProcessor_Start_Error(t *testing.T) {
 	defer restoreLogLevel(prevLevel)
 
 	distributor := snapshot.New(groups.IndexFunction)
-	cfg := &Config{Mesh: meshconfig.NewInMemory()}
+	cfg := &Config{
+		Mesh:   meshconfig.NewInMemory(),
+		Schema: resources.TestSchema,
+	}
 	p := NewProcessor(&erroneousSource{}, distributor, cfg)
 
 	err := p.Start()
@@ -102,68 +106,6 @@ func TestProcessor_Stop(t *testing.T) {
 	p.Stop()
 }
 
-func TestProcessor_EventAccumulation(t *testing.T) {
-	// Set the log level to debug for codecov.
-	prevLevel := setDebugLogLevel()
-	defer restoreLogLevel(prevLevel)
-
-	src := NewInMemorySource()
-	distributor := NewInMemoryDistributor()
-	// Do not quiesce/timeout for an hour
-	stateStrategy := publish.NewStrategy(time.Hour, time.Hour, time.Millisecond)
-
-	p := newTestProcessor(src, stateStrategy, distributor, nil)
-	err := p.Start()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer p.Stop()
-
-	awaitFullSync(t, p)
-
-	k1 := resource.Key{Collection: resources.EmptyInfo.Collection, FullName: resource.FullNameFromNamespaceAndName("", "r1")}
-	src.Set(k1, resource.Metadata{}, &types.Empty{})
-
-	// Wait "long enough"
-	time.Sleep(time.Second * 1)
-
-	if distributor.NumSnapshots() != 0 {
-		t.Fatalf("snapshot shouldn't have been distributed: %+v", distributor)
-	}
-}
-
-func TestProcessor_EventAccumulation_WithFullSync(t *testing.T) {
-	// Set the log level to debug for codecov.
-	prevLevel := setDebugLogLevel()
-	defer restoreLogLevel(prevLevel)
-
-	info, _ := resources.TestSchema.Lookup("empty")
-
-	src := NewInMemorySource()
-	distributor := NewInMemoryDistributor()
-	// Do not quiesce/timeout for an hour
-	stateStrategy := publish.NewStrategy(time.Hour, time.Hour, time.Millisecond)
-
-	p := newTestProcessor(src, stateStrategy, distributor, nil)
-	err := p.Start()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer p.Stop()
-
-	awaitFullSync(t, p)
-
-	k1 := resource.Key{Collection: info.Collection, FullName: resource.FullNameFromNamespaceAndName("", "r1")}
-	src.Set(k1, resource.Metadata{}, &types.Empty{})
-
-	// Wait "long enough"
-	time.Sleep(time.Second * 1)
-
-	if distributor.NumSnapshots() != 0 {
-		t.Fatalf("snapshot shouldn't have been distributed: %+v", distributor)
-	}
-}
-
 func TestProcessor_Publishing(t *testing.T) {
 	// Set the log level to debug for codecov.
 	prevLevel := setDebugLogLevel()
@@ -179,7 +121,7 @@ func TestProcessor_Publishing(t *testing.T) {
 	hookFn := func() {
 		processCallCount.Done()
 	}
-	processCallCount.Add(3) // 1 for add, 1 for sync, 1 for publish trigger
+	processCallCount.Add(2) // 1 for sync, 1 for publish trigger
 
 	p := newTestProcessor(src, stateStrategy, distributor, hookFn)
 	err := p.Start()
@@ -190,11 +132,18 @@ func TestProcessor_Publishing(t *testing.T) {
 
 	awaitFullSync(t, p)
 
+	// Wait for up to 5 seconds.
+	if err := timedfn.WithTimeout(processCallCount.Wait, timeout); err != nil {
+		t.Fatal(err)
+	}
+
+	processCallCount.Add(2) // 1 for add, 1 for publish trigger
+
 	k1 := resource.Key{Collection: info.Collection, FullName: resource.FullNameFromNamespaceAndName("", "r1")}
 	src.Set(k1, resource.Metadata{}, &types.Empty{})
 
 	// Wait for up to 5 seconds.
-	if err := wait.WithTimeout(processCallCount.Wait, timeout); err != nil {
+	if err := timedfn.WithTimeout(processCallCount.Wait, timeout); err != nil {
 		t.Fatal(err)
 	}
 
@@ -211,7 +160,7 @@ func awaitFullSync(t *testing.T, p *Processor) {
 
 func newTestProcessor(src Source, stateStrategy *publish.Strategy,
 	distributor Distributor, hookFn postProcessHookFn) *Processor {
-	return newProcessor(src, cfg, resources.TestSchema, stateStrategy, distributor, hookFn)
+	return newProcessor(src, cfg, stateStrategy, distributor, hookFn)
 }
 
 func setDebugLogLevel() log.Level {
@@ -222,4 +171,29 @@ func setDebugLogLevel() log.Level {
 
 func restoreLogLevel(level log.Level) {
 	runtimeLog.Scope.SetOutputLevel(level)
+}
+
+func TestProcessor_MeshConfig(t *testing.T) {
+	distributor := snapshot.New(groups.IndexFunction)
+	src := NewInMemorySource()
+	b := resource.NewSchemaBuilder()
+	b.RegisterSchema(resources.TestSchema)
+	b.Register(
+		"istio/mesh/v1alpha1/MeshConfig",
+		"type.googleapis.com/istio.mesh.v1alpha1.MeshConfig")
+	types := b.Build()
+	i := types.Get("istio/mesh/v1alpha1/MeshConfig")
+
+	cfg := &Config{
+		Mesh:   meshconfig.NewInMemory(),
+		Schema: types,
+	}
+	p := NewProcessor(src, distributor, cfg)
+	st, ok := p.state.getResourceTypeState(i.Collection)
+	if ok != true {
+		t.Fatalf("Could not get resource type state")
+	}
+	if st.version != 1 {
+		t.Errorf("Meshconfig version not set")
+	}
 }

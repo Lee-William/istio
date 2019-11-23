@@ -22,14 +22,16 @@ import (
 	"time"
 
 	"github.com/mitchellh/go-homedir"
-	yaml2 "gopkg.in/yaml.v2"
 
-	kubeCore "k8s.io/api/core/v1"
+	yaml2 "gopkg.in/yaml.v2"
 
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
-	"istio.io/istio/pkg/test/framework/components/deployment"
+	"istio.io/istio/pkg/test/framework/core/image"
 	"istio.io/istio/pkg/test/framework/resource"
+	"istio.io/istio/pkg/test/util/file"
+
+	kubeCore "k8s.io/api/core/v1"
 )
 
 const (
@@ -52,41 +54,57 @@ const (
 
 	// DefaultCIUndeployTimeout for Istio.
 	DefaultCIUndeployTimeout = time.Second * 900
-
-	// DefaultIstioChartRepo for Istio.
-	DefaultIstioChartRepo = "https://gcsweb.istio.io/gcs/istio-prerelease/daily-build/release-1.1-latest-daily/charts/"
 )
 
 var (
 	helmValues string
 
 	settingsFromCommandline = &Config{
-		ChartRepo:       DefaultIstioChartRepo,
-		SystemNamespace: DefaultSystemNamespace,
-		DeployIstio:     true,
-		DeployTimeout:   0,
-		UndeployTimeout: 0,
-		ChartDir:        env.IstioChartDir,
-		CrdsFilesDir:    env.CrdsFilesDir,
-		ValuesFile:      E2EValuesFile,
+		SystemNamespace:                DefaultSystemNamespace,
+		IstioNamespace:                 DefaultSystemNamespace,
+		ConfigNamespace:                DefaultSystemNamespace,
+		TelemetryNamespace:             DefaultSystemNamespace,
+		PolicyNamespace:                DefaultSystemNamespace,
+		IngressNamespace:               DefaultSystemNamespace,
+		EgressNamespace:                DefaultSystemNamespace,
+		DeployIstio:                    true,
+		DeployTimeout:                  0,
+		UndeployTimeout:                0,
+		ChartDir:                       env.IstioChartDir,
+		CrdsFilesDir:                   env.CrdsFilesDir,
+		ValuesFile:                     E2EValuesFile,
+		CustomSidecarInjectorNamespace: "",
 	}
 )
 
 // Config provide kube-specific Config from flags.
 type Config struct {
-	// The namespace where the Istio components reside in a typical deployment (default: "istio-system").
+	// The namespace where the Istio components (<=1.1) reside in a typical deployment (default: "istio-system").
 	SystemNamespace string
 
-	// Indicates that the test should deploy Istio into the target Kubernetes cluster before running tests.
-	DeployIstio bool
+	// The namespace in which istio ca and cert provisioning components are deployed.
+	IstioNamespace string
+
+	// The namespace in which config, discovery and auto-injector are deployed.
+	ConfigNamespace string
+
+	// The namespace in which mixer, kiali, tracing providers, graphana, prometheus are deployed.
+	TelemetryNamespace string
+
+	// The namespace in which istio policy checker is deployed.
+	PolicyNamespace string
+
+	// The namespace in which istio ingressgateway is deployed
+	IngressNamespace string
+
+	// The namespace in which istio egressgateway is deployed
+	EgressNamespace string
 
 	// DeployTimeout the timeout for deploying Istio.
 	DeployTimeout time.Duration
 
 	// UndeployTimeout the timeout for undeploying Istio.
 	UndeployTimeout time.Duration
-
-	ChartRepo string
 
 	// The top-level Helm chart dir.
 	ChartDir string
@@ -99,17 +117,29 @@ type Config struct {
 
 	// Overrides for the Helm values file.
 	Values map[string]string
+
+	// Indicates that the test should deploy Istio into the target Kubernetes cluster before running tests.
+	DeployIstio bool
+
+	// Do not wait for the validation webhook before completing the deployment. This is useful for
+	// doing deployments without Galley.
+	SkipWaitForValidationWebhook bool
+
+	// CustomSidecarInjectorNamespace allows injecting the sidecar from the specified namespace.
+	// if the value is "", use the default sidecar injection instead.
+	CustomSidecarInjectorNamespace string
 }
 
-// Is mtls enabled. Check in Values flag and Values file.
+// IsMtlsEnabled checks in Values flag and Values file.
 func (c *Config) IsMtlsEnabled() bool {
-	if c.Values["global.mtls.enabled"] == "true" {
+	if c.Values["global.mtls.enabled"] == "true" ||
+		c.Values["global.mtls.auto"] == "true" {
 		return true
 	}
 
-	data, err := test.ReadConfigFile(filepath.Join(c.ChartDir, c.ValuesFile))
+	data, err := file.AsString(filepath.Join(c.ChartDir, c.ValuesFile))
 	if err != nil {
-		return false
+		return true
 	}
 	m := make(map[interface{}]interface{})
 	err = yaml2.Unmarshal([]byte(data), &m)
@@ -121,12 +151,14 @@ func (c *Config) IsMtlsEnabled() bool {
 		case map[interface{}]interface{}:
 			switch mtlsVal := globalVal["mtls"].(type) {
 			case map[interface{}]interface{}:
-				return mtlsVal["enabled"].(bool)
+				if !mtlsVal["enabled"].(bool) && !mtlsVal["auto"].(bool) {
+					return false
+				}
 			}
 		}
 	}
 
-	return false
+	return true
 }
 
 // DefaultConfig creates a new Config from defaults, environments variables, and command-line parameters.
@@ -146,12 +178,12 @@ func DefaultConfig(ctx resource.Context) (Config, error) {
 		return Config{}, err
 	}
 
-	deps, err := deployment.SettingsFromCommandLine()
+	deps, err := image.SettingsFromCommandLine()
 	if err != nil {
 		return Config{}, err
 	}
 
-	if s.Values, err = newHelmValues(deps); err != nil {
+	if s.Values, err = newHelmValues(ctx, deps); err != nil {
 		return Config{}, err
 	}
 
@@ -164,6 +196,15 @@ func DefaultConfig(ctx resource.Context) (Config, error) {
 	}
 
 	return s, nil
+}
+
+// DefaultConfigOrFail calls DefaultConfig and fails t if an error occurs.
+func DefaultConfigOrFail(t test.Failer, ctx resource.Context) Config {
+	cfg, err := DefaultConfig(ctx)
+	if err != nil {
+		t.Fatalf("Get istio config: %v", err)
+	}
+	return cfg
 }
 
 func normalizeFile(path *string) error {
@@ -184,7 +225,7 @@ func checkFileExists(path string) error {
 	return nil
 }
 
-func newHelmValues(s *deployment.Settings) (map[string]string, error) {
+func newHelmValues(ctx resource.Context, s *image.Settings) (map[string]string, error) {
 	userValues, err := parseHelmValues()
 	if err != nil {
 		return nil, err
@@ -194,9 +235,9 @@ func newHelmValues(s *deployment.Settings) (map[string]string, error) {
 	values := make(map[string]string)
 
 	// Common values
-	values[deployment.HubValuesKey] = s.Hub
-	values[deployment.TagValuesKey] = s.Tag
-	values[deployment.ImagePullPolicyValuesKey] = s.PullPolicy
+	values[image.HubValuesKey] = s.Hub
+	values[image.TagValuesKey] = s.Tag
+	values[image.ImagePullPolicyValuesKey] = s.PullPolicy
 
 	// Copy the user values.
 	for k, v := range userValues {
@@ -204,9 +245,16 @@ func newHelmValues(s *deployment.Settings) (map[string]string, error) {
 	}
 
 	// Always pull Docker images if using the "latest".
-	if values[deployment.TagValuesKey] == deployment.LatestTag {
-		values[deployment.ImagePullPolicyValuesKey] = string(kubeCore.PullAlways)
+	if values[image.TagValuesKey] == image.LatestTag {
+		values[image.ImagePullPolicyValuesKey] = string(kubeCore.PullAlways)
 	}
+
+	// We need more information on Envoy logs to detect usage of any deprecated feature
+	if ctx.Settings().FailOnDeprecation {
+		values["global.proxy.logLevel"] = "debug"
+		values["global.proxy.componentLogLevel"] = "misc:debug"
+	}
+
 	return values, nil
 }
 
@@ -231,11 +279,22 @@ func parseHelmValues() (map[string]string, error) {
 func (c *Config) String() string {
 	result := ""
 
-	result += fmt.Sprintf("SystemNamespace: %s\n", c.SystemNamespace)
-	result += fmt.Sprintf("DeployIstio:     %v\n", c.DeployIstio)
-	result += fmt.Sprintf("DeployTimeout:   %s\n", c.DeployTimeout.String())
-	result += fmt.Sprintf("UndeployTimeout: %s\n", c.UndeployTimeout.String())
-	result += fmt.Sprintf("Values:          %v\n", c.Values)
+	result += fmt.Sprintf("SystemNamespace:                %s\n", c.SystemNamespace)
+	result += fmt.Sprintf("IstioNamespace:                 %s\n", c.IstioNamespace)
+	result += fmt.Sprintf("ConfigNamespace:                %s\n", c.ConfigNamespace)
+	result += fmt.Sprintf("TelemetryNamespace:             %s\n", c.TelemetryNamespace)
+	result += fmt.Sprintf("PolicyNamespace:                %s\n", c.PolicyNamespace)
+	result += fmt.Sprintf("IngressNamespace:               %s\n", c.IngressNamespace)
+	result += fmt.Sprintf("EgressNamespace:                %s\n", c.EgressNamespace)
+	result += fmt.Sprintf("DeployIstio:                    %v\n", c.DeployIstio)
+	result += fmt.Sprintf("DeployTimeout:                  %s\n", c.DeployTimeout.String())
+	result += fmt.Sprintf("UndeployTimeout:                %s\n", c.UndeployTimeout.String())
+	result += fmt.Sprintf("Values:                         %v\n", c.Values)
+	result += fmt.Sprintf("ChartDir:                       %s\n", c.ChartDir)
+	result += fmt.Sprintf("CrdsFilesDir:                   %s\n", c.CrdsFilesDir)
+	result += fmt.Sprintf("ValuesFile:                     %s\n", c.ValuesFile)
+	result += fmt.Sprintf("SkipWaitForValidationWebhook:   %v\n", c.SkipWaitForValidationWebhook)
+	result += fmt.Sprintf("CustomSidecarInjectorNamespace: %s\n", c.CustomSidecarInjectorNamespace)
 
 	return result
 }

@@ -15,13 +15,11 @@
 package util
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/http"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,10 +28,10 @@ import (
 	"time"
 
 	"github.com/google/go-github/github"
-	"github.com/pkg/errors"
 
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/test/env"
+	"istio.io/istio/pkg/test/util"
+	"istio.io/pkg/log"
 )
 
 const (
@@ -137,6 +135,12 @@ func ShellMuteOutput(format string, args ...interface{}) (string, error) {
 	return sh(context.Background(), format, true, false, true, args...)
 }
 
+// ShellMuteOutput run command on shell and get back output and error if get one
+// without logging the output or errors
+func ShellMuteOutputError(format string, args ...interface{}) (string, error) {
+	return sh(context.Background(), format, true, false, false, args...)
+}
+
 // ShellSilent runs command on shell and get back output and error if get one
 // without logging the command or output.
 func ShellSilent(format string, args ...interface{}) (string, error) {
@@ -186,40 +190,6 @@ func Record(command, record string) error {
 		return err
 	}
 	err = ioutil.WriteFile(record, []byte(resp), 0600)
-	return err
-}
-
-// HTTPDownload download from src(url) and store into dst(local file)
-func HTTPDownload(dst string, src string) error {
-	log.Infof("Start downloading from %s to %s ...\n", src, dst)
-	var err error
-	var out *os.File
-	var resp *http.Response
-	out, err = os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err = out.Close(); err != nil {
-			log.Errorf("Error: close file %s, %s", dst, err)
-		}
-	}()
-	resp, err = http.Get(src)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err = resp.Body.Close(); err != nil {
-			log.Errorf("Error: close downloaded file from %s, %s", src, err)
-		}
-	}()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("http get request, received unexpected response status: %s", resp.Status)
-	}
-	if _, err = io.Copy(out, resp.Body); err != nil {
-		return err
-	}
-	log.Info("Download successfully!")
 	return err
 }
 
@@ -284,7 +254,7 @@ func DownloadRelease(version, tmpDir string) (string, error) {
 	url := fmt.Sprintf(releaseURL, version, version, osExt)
 	fname := fmt.Sprintf("istio-%s.tar.gz", version)
 	tgz := filepath.Join(tmpDir, fname)
-	err = HTTPDownload(tgz, url)
+	err = util.HTTPDownload(tgz, url)
 	if err != nil {
 		return "", err
 	}
@@ -292,7 +262,7 @@ func DownloadRelease(version, tmpDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	err = ExtractTarGz(f)
+	err = util.ExtractTarGz(f, tmpDir)
 	if err != nil {
 		return "", err
 	}
@@ -300,43 +270,14 @@ func DownloadRelease(version, tmpDir string) (string, error) {
 	return filepath.Join(tmpDir, subdir), nil
 }
 
-// ExtractTarGz extracts a .tar.gz file into current dir.
-func ExtractTarGz(gzipStream io.Reader) error {
-	uncompressedStream, err := gzip.NewReader(gzipStream)
-	if err != nil {
-		return errors.Wrap(err, "Fail to uncompress")
+const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+// RandomString returns a random string of size n (letters only)
+func RandomString(n int) string {
+	rand.Seed(time.Now().UnixNano())
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[rand.Int63()%int64(len(letters))]
 	}
-	tarReader := tar.NewReader(uncompressedStream)
-
-	for {
-		header, err := tarReader.Next()
-
-		if err == io.EOF {
-			break
-		}
-
-		if err != nil {
-			return errors.Wrap(err, "ExtractTarGz: Next() failed")
-		}
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.Mkdir(header.Name, 0755); err != nil {
-				return errors.Wrap(err, "ExtractTarGz: Mkdir() failed")
-			}
-		case tar.TypeReg:
-			outFile, err := os.Create(header.Name)
-			if err != nil {
-				return errors.Wrap(err, "ExtractTarGz: Create() failed")
-			}
-			defer outFile.Close() // nolint: errcheck
-			if _, err := io.Copy(outFile, tarReader); err != nil {
-				return errors.Wrap(err, "ExtractTarGz: Copy() failed")
-			}
-		default:
-			return fmt.Errorf("unknown type: %s in %s",
-				string(header.Typeflag), header.Name)
-		}
-	}
-	return nil
+	return string(b)
 }

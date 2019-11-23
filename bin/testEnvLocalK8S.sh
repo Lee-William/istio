@@ -18,14 +18,13 @@ set -euo pipefail
 
 # testEnv will setup a local test environment, for running Istio unit tests.
 
-# Based on circleCI config - used to reproduce the environment and to improve local testing
-
-# expect istio scripts to be under $GOPATH/src/istio.io/istio/bin/...
+# Based on local kubeconfig - used to reproduce the environment and to improve local testing
 
 # If GOPATH is made up of several paths, use the first one for our targets in this file
 export GO_TOP=${GO_TOP:-$(echo "${GOPATH}" | cut -d ':' -f1)}
 
-export ISTIO_GO=${GO_TOP}/src/istio.io/istio
+REPO_ROOT=$(git rev-parse --show-toplevel)
+export ISTIO_GO=${REPO_ROOT}
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
   export GOOS_LOCAL=darwin
@@ -39,7 +38,7 @@ export PATH=${GO_TOP}/bin:${PATH}
 export OUT=${GO_TOP}/out
 export ISTIO_OUT=${ISTIO_OUT:-${GO_TOP}/out/${GOOS_LOCAL}_amd64/release}
 
-# components used in the test (starting with circleci for consistency, eventually ci will use this)
+# components used in the test
 export K8S_VER=${K8S_VER:-v1.9.2}
 export ETCD_VER=${ETCD_VER:-v3.2.15}
 
@@ -47,12 +46,12 @@ export MASTER_IP=127.0.0.1
 export MASTER_CLUSTER_IP=10.99.0.1
 
 # TODO: customize the ports and generate a local config
-export KUBECONFIG=${GO_TOP}/src/istio.io/istio/.circleci/config
+export KUBECONFIG=${REPO_ROOT}/tests/util/kubeconfig
 
 "${ISTIO_GO}/bin/init.sh"
 
 # Checked in certificates, to avoid regenerating them
-CERTDIR=${CERTDIR:-${ISTIO_GO}/.circleci/pki/istio-certs}
+CERTDIR=${CERTDIR:-${ISTIO_GO}/tests/util/pki/istio-certs}
 LOG_DIR=${LOG_DIR:-${OUT}/log}
 ETCD_DATADIR=${ETCD_DATADIR:-${OUT}/etcd-data}
 
@@ -205,7 +204,7 @@ function startPilot() {
   "${ISTIO_OUT}/pilot-discovery" discovery --httpAddr ":18080" \
                                          --monitoringAddr ":19093" \
                                          --log_target "${LOG_DIR}/pilot.log" \
-                                         --kubeconfig "${ISTIO_GO}/.circleci/config" &
+                                         --kubeconfig "${ISTIO_GO}/tests/util/kubeconfig" &
   echo $! > "$LOG_DIR/pilot.pid"
 }
 
@@ -221,7 +220,6 @@ function startEnvoy() {
     "${ISTIO_OUT}/envoy" -c tests/testdata/multicluster/envoy_local_v2.yaml \
         --base-id 4 --service-cluster xds_cluster \
         --service-node local.test \
-        --allow-unknown-fields \
         --log-level debug \
         --log-path "${LOG_DIR}/envoy.log"&
     echo $! > "$LOG_DIR/envoy4.pid"

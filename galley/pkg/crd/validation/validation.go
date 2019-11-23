@@ -23,19 +23,16 @@ import (
 	"regexp"
 	"time"
 
-	multierror "github.com/hashicorp/go-multierror"
+	"k8s.io/client-go/kubernetes"
 
-	"istio.io/istio/mixer/adapter"
-	"istio.io/istio/mixer/pkg/config"
-	"istio.io/istio/mixer/pkg/config/store"
-	runtimeConfig "istio.io/istio/mixer/pkg/runtime/config"
-	"istio.io/istio/mixer/pkg/template"
-	generatedTmplRepo "istio.io/istio/mixer/template"
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/cmd"
+	"github.com/hashicorp/go-multierror"
+
+	"istio.io/pkg/log"
+	"istio.io/pkg/probe"
+
+	mixervalidate "istio.io/istio/mixer/pkg/validate"
+	"istio.io/istio/pkg/config/schemas"
 	"istio.io/istio/pkg/kube"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/probe"
 )
 
 const (
@@ -52,25 +49,10 @@ type httpClient interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// createMixerValidator creates a mixer backend validator.
-// TODO(https://github.com/istio/istio/issues/4887) - refactor mixer
-// config validation to remove galley dependency on mixer internal
-// packages.
-func createMixerValidator() store.BackendValidator {
-	info := generatedTmplRepo.SupportedTmplInfo
-	templates := make(map[string]*template.Info, len(info))
-	for k := range info {
-		t := info[k]
-		templates[k] = &t
-	}
-	adapters := config.AdapterInfoMap(adapter.Inventory(), template.NewRepository(info).SupportsTemplate)
-	return store.NewValidator(nil, runtimeConfig.KindMap(adapters, templates))
-}
-
 func webhookHTTPSHandlerReady(client httpClient, vc *WebhookParameters) error {
 	readinessURL := &url.URL{
 		Scheme: "https",
-		Host:   fmt.Sprintf("127.0.0.1:%v", vc.Port),
+		Host:   fmt.Sprintf("localhost:%v", vc.Port),
 		Path:   httpsHandlerReadyPath,
 	}
 
@@ -92,19 +74,28 @@ func webhookHTTPSHandlerReady(client httpClient, vc *WebhookParameters) error {
 }
 
 //RunValidation start running Galley validation mode
-func RunValidation(vc *WebhookParameters, kubeConfig string,
-	livenessProbeController, readinessProbeController probe.Controller) {
-	log.Infof("Galley validation started with\n%s", vc)
-	mixerValidator := createMixerValidator()
-	clientset, err := kube.CreateClientset(kubeConfig, "")
-	if err != nil {
-		log.Fatalf("could not create k8s clientset: %v", err)
+func RunValidation(ready chan<- struct{}, stopCh chan struct{}, vc *WebhookParameters,
+	kubeInterface kubernetes.Interface, kubeConfig string, livenessProbeController, readinessProbeController probe.Controller) {
+	log.Infof("Galley validation started with \n%s", vc)
+	mixerValidator := mixervalidate.NewDefaultValidator(false)
+
+	var clientset kubernetes.Interface
+	var err error
+	// The linter insists on passing kube.Interface - but checking kubeInterface == nil will
+	// fail - the value is nil, not the interface. Magic of go.
+	if kubeInterface.(*kubernetes.Clientset) == nil {
+		clientset, err = kube.CreateClientset(kubeConfig, "")
+		if err != nil {
+			log.Fatalf("could not create k8s clientset: %v", err)
+		}
+	} else {
+		clientset = kubeInterface
 	}
 	vc.MixerValidator = mixerValidator
-	vc.PilotDescriptor = model.IstioConfigTypes
+	vc.PilotDescriptor = schemas.Istio
 	vc.Clientset = clientset
 	wh, err := NewWebhook(*vc)
-	if err != nil {
+	if err != nil || vc.Clientset == nil {
 		log.Fatalf("cannot create validation webhook service: %v", err)
 	}
 	if livenessProbeController != nil {
@@ -113,9 +104,6 @@ func RunValidation(vc *WebhookParameters, kubeConfig string,
 		validationLivenessProbe.RegisterProbe(livenessProbeController, "validationLiveness")
 		defer validationLivenessProbe.SetAvailable(errors.New("stopped"))
 	}
-
-	// Create the stop channel for all of the servers.
-	stop := make(chan struct{})
 
 	if readinessProbeController != nil {
 		validationReadinessProbe := probe.NewProbe()
@@ -136,18 +124,18 @@ func RunValidation(vc *WebhookParameters, kubeConfig string,
 			for {
 				if err := webhookHTTPSHandlerReady(client, vc); err != nil {
 					validationReadinessProbe.SetAvailable(errors.New("not ready"))
-					scope.Infof("https handler for validation webhook is not ready: %v", err)
+					scope.Infof("https handler for validation webhook is not ready: %v\n", err)
 					ready = false
 				} else {
 					validationReadinessProbe.SetAvailable(nil)
 
 					if !ready {
-						scope.Info("https handler for validation webhook is ready")
+						scope.Info("https handler for validation webhook is ready\n")
 						ready = true
 					}
 				}
 				select {
-				case <-stop:
+				case <-stopCh:
 					validationReadinessProbe.SetAvailable(errors.New("stopped"))
 					return
 				case <-time.After(httpsHandlerReadinessFreq):
@@ -157,8 +145,7 @@ func RunValidation(vc *WebhookParameters, kubeConfig string,
 		}()
 	}
 
-	go wh.Run(stop)
-	cmd.WaitSignal(stop)
+	go wh.Run(ready, stopCh)
 }
 
 // isDNS1123Label tests for a string that conforms to the definition of a label in
@@ -176,39 +163,39 @@ func validatePort(port int) error {
 }
 
 // Validate tests if the WebhookParameters has valid params.
-func (args *WebhookParameters) Validate() error {
-	if args == nil {
+func (p *WebhookParameters) Validate() error {
+	if p == nil {
 		return errors.New("nil WebhookParameters")
 	}
 
 	var errs *multierror.Error
-	if args.EnableValidation {
+	if p.EnableValidation {
 		// Validate the options that exposed to end users
-		if args.WebhookName == "" || !isDNS1123Label(args.WebhookName) {
-			errs = multierror.Append(errs, fmt.Errorf("invalid webhook name: %q", args.WebhookName)) // nolint: lll
+		if p.WebhookName == "" || !isDNS1123Label(p.WebhookName) {
+			errs = multierror.Append(errs, fmt.Errorf("invalid webhook name: %q", p.WebhookName)) // nolint: lll
 		}
-		if args.DeploymentName == "" || !isDNS1123Label(args.DeploymentAndServiceNamespace) {
-			errs = multierror.Append(errs, fmt.Errorf("invalid deployment namespace: %q", args.DeploymentAndServiceNamespace)) // nolint: lll
+		if p.DeploymentName == "" || !isDNS1123Label(p.DeploymentAndServiceNamespace) {
+			errs = multierror.Append(errs, fmt.Errorf("invalid deployment namespace: %q", p.DeploymentAndServiceNamespace)) // nolint: lll
 		}
-		if args.DeploymentName == "" || !isDNS1123Label(args.DeploymentName) {
-			errs = multierror.Append(errs, fmt.Errorf("invalid deployment name: %q", args.DeploymentName))
+		if p.DeploymentName == "" || !isDNS1123Label(p.DeploymentName) {
+			errs = multierror.Append(errs, fmt.Errorf("invalid deployment name: %q", p.DeploymentName))
 		}
-		if args.ServiceName == "" || !isDNS1123Label(args.ServiceName) {
-			errs = multierror.Append(errs, fmt.Errorf("invalid service name: %q", args.ServiceName))
+		if p.ServiceName == "" || !isDNS1123Label(p.ServiceName) {
+			errs = multierror.Append(errs, fmt.Errorf("invalid service name: %q", p.ServiceName))
 		}
-		if len(args.WebhookConfigFile) == 0 {
+		if len(p.WebhookConfigFile) == 0 {
 			errs = multierror.Append(errs, errors.New("webhookConfigFile not specified"))
 		}
-		if len(args.CertFile) == 0 {
+		if len(p.CertFile) == 0 {
 			errs = multierror.Append(errs, errors.New("cert file not specified"))
 		}
-		if len(args.KeyFile) == 0 {
+		if len(p.KeyFile) == 0 {
 			errs = multierror.Append(errs, errors.New("key file not specified"))
 		}
-		if len(args.CACertFile) == 0 {
+		if len(p.CACertFile) == 0 {
 			errs = multierror.Append(errs, errors.New("CA cert file not specified"))
 		}
-		if err := validatePort(int(args.Port)); err != nil {
+		if err := validatePort(int(p.Port)); err != nil {
 			errs = multierror.Append(errs, err)
 		}
 	}

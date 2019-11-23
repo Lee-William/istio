@@ -16,12 +16,19 @@ package cmd
 
 import (
 	"flag"
+	"fmt"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
+	"github.com/spf13/viper"
 
-	"istio.io/istio/pkg/collateral"
-	"istio.io/istio/pkg/version"
+	"istio.io/istio/galley/pkg/envvar"
+	"istio.io/pkg/collateral"
+	"istio.io/pkg/collateral/metrics"
+	"istio.io/pkg/env"
+	"istio.io/pkg/version"
 )
 
 // GetRootCmd returns the root of the cobra command-tree.
@@ -38,18 +45,64 @@ func GetRootCmd(args []string) *cobra.Command {
 		},
 	}
 
+	var cfgFile string
+	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "Config file containing args")
+
+	cobra.OnInitialize(func() {
+		if len(cfgFile) > 0 {
+			viper.SetConfigFile(cfgFile)
+			err := viper.ReadInConfig() // Find and read the config file
+			if err != nil {             // Handle errors reading the config file
+				_, _ = os.Stderr.WriteString(fmt.Errorf("fatal error in config file: %s", err).Error())
+				os.Exit(1)
+			}
+		}
+	})
+
 	rootCmd.SetArgs(args)
 	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 	rootCmd.AddCommand(serverCmd())
 	rootCmd.AddCommand(probeCmd())
 	rootCmd.AddCommand(version.CobraCommand())
-	rootCmd.AddCommand(collateral.CobraCommand(rootCmd, &doc.GenManHeader{
+
+	// TODO: We need to filter out the collaterals, as Galley has code-level dependencies on other component's code.
+	// Over time, this set of dependencies should go away. Until then, using CobraCommandWithFilter to filter out
+	// the environment variables and metrics.
+	rootCmd.AddCommand(collateral.CobraCommandWithFilter(rootCmd, &doc.GenManHeader{
 		Title:   "Istio Galley Server",
 		Section: "galley CLI",
 		Manual:  "Istio Galley Server",
+	}, collateral.Predicates{
+		SelectEnv:    selectEnv,
+		SelectMetric: selectMetric,
 	}))
 
 	loggingOptions.AttachCobraFlags(rootCmd)
 
 	return rootCmd
+}
+
+func selectEnv(e env.Var) bool {
+	for _, n := range envvar.RegisteredEnvVarNames() {
+		if e.Name == n {
+			return true
+		}
+	}
+	return false
+}
+
+func selectMetric(m metrics.Exported) bool {
+	if strings.HasPrefix(m.Name, "pilot") {
+		return false
+	}
+
+	if strings.HasPrefix(m.Name, "mixer") {
+		return false
+	}
+
+	if m.Name == "endpoint_no_pod" {
+		return false
+	}
+
+	return true
 }

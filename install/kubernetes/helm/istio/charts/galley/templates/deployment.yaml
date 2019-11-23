@@ -1,4 +1,4 @@
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: istio-galley
@@ -11,20 +11,26 @@ metadata:
     istio: galley
 spec:
   replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      istio: galley
   strategy:
     rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+      maxSurge: {{ .Values.rollingMaxSurge }}
+      maxUnavailable: {{ .Values.rollingMaxUnavailable }}
   template:
     metadata:
       labels:
         app: {{ template "galley.name" . }}
         chart: {{ template "galley.chart" . }}
         heritage: {{ .Release.Service }}
-        release: {{ .Release.Name }}      
+        release: {{ .Release.Name }}
         istio: galley
       annotations:
         sidecar.istio.io/inject: "false"
+         {{- if .Values.podAnnotations }}
+{{ toYaml .Values.podAnnotations | indent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: istio-galley-service-account
 {{- if .Values.global.priorityClassName }}
@@ -39,7 +45,7 @@ spec:
 {{- end }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
-          - containerPort: 443
+          - containerPort: 9443
           - containerPort: {{ .Values.global.monitoringPort }}
           - containerPort: 9901
           command:
@@ -47,16 +53,28 @@ spec:
           - server
           - --meshConfigFile=/etc/mesh-config/mesh
           - --livenessProbeInterval=1s
-          - --livenessProbePath=/healthliveness
-          - --readinessProbePath=/healthready
+          - --livenessProbePath=/tmp/healthliveness
+          - --readinessProbePath=/tmp/healthready
           - --readinessProbeInterval=1s
+          - --deployment-namespace={{ .Release.Namespace }}
 {{- if $.Values.global.controlPlaneSecurityEnabled}}
           - --insecure=false
 {{- else }}
           - --insecure=true
 {{- end }}
+{{- if .Values.enableServiceDiscovery }}
+          - --enableServiceDiscovery=true
+{{- end }}
 {{- if not $.Values.global.useMCP }}
           - --enable-server=false
+{{- end }}
+{{- if not $.Values.global.configValidation }}
+          - --enable-validation=false
+{{- end }}
+{{- if .Values.global.operatorManageWebhooks }}
+          - --enable-reconcileWebhookConfiguration=false
+{{- else }}
+          - --enable-reconcileWebhookConfiguration=true
 {{- end }}
           - --validation-webhook-config-file
           - /etc/config/validatingwebhookconfiguration.yaml
@@ -64,10 +82,23 @@ spec:
 {{- if $.Values.global.logging.level }}
           - --log_output_level={{ $.Values.global.logging.level }}
 {{- end}}
+{{- if .Values.enableAnalysis }}
+          - --enableAnalysis=true
+{{- end }}
+{{- if .Values.global.certificates }}
+          - --validation.tls.clientCertificate=/etc/dnscerts/cert-chain.pem
+          - --validation.tls.privateKey=/etc/dnscerts/key.pem
+          - --validation.tls.caCertificates=/etc/dnscerts/root-cert.pem
+{{- end }}
           volumeMounts:
           - name: certs
             mountPath: /etc/certs
             readOnly: true
+{{- if .Values.global.certificates }}
+          - name: dnscerts
+            mountPath: /etc/dnscerts
+            readOnly: true
+{{- end }}
           - name: config
             mountPath: /etc/config
             readOnly: true
@@ -79,7 +110,7 @@ spec:
               command:
                 - /usr/local/bin/galley
                 - probe
-                - --probe-path=/healthliveness
+                - --probe-path=/tmp/healthliveness
                 - --interval=10s
             initialDelaySeconds: 5
             periodSeconds: 5
@@ -88,7 +119,7 @@ spec:
               command:
                 - /usr/local/bin/galley
                 - probe
-                - --probe-path=/healthready
+                - --probe-path=/tmp/healthready
                 - --interval=10s
             initialDelaySeconds: 5
             periodSeconds: 5
@@ -102,6 +133,11 @@ spec:
       - name: certs
         secret:
           secretName: istio.istio-galley-service-account
+{{- if .Values.global.certificates }}
+      - name: dnscerts
+        secret:
+          secretName: dns.istio-galley-service-account
+{{- end }}
       - name: config
         configMap:
           name: istio-galley-configuration
@@ -111,3 +147,10 @@ spec:
       affinity:
       {{- include "nodeaffinity" . | indent 6 }}
       {{- include "podAntiAffinity" . | indent 6 }}
+      {{- if .Values.tolerations }}
+      tolerations:
+{{ toYaml .Values.tolerations | indent 6 }}
+      {{- else if .Values.global.defaultTolerations }}
+      tolerations:
+{{ toYaml .Values.global.defaultTolerations | indent 6 }}
+      {{- end }}

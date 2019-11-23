@@ -89,6 +89,32 @@ func (e *Environment) ApplyContents(namespace, yml string) error {
 	return err
 }
 
+// ApplyContentsDryRun applies the given yaml contents to the namespace in DryRun mode.
+func (e *Environment) ApplyContentsDryRun(namespace, yml string) error {
+	_, err := e.Accessor.ApplyContentsDryRun(namespace, yml)
+	return err
+}
+
+// Apply applies the config in the given filename to the namespace.
+func (e *Environment) Apply(namespace, ymlFile string) error {
+	return e.Accessor.Apply(namespace, ymlFile)
+}
+
+// ApplyDryRun applies the config in the given filename to the namespace in DryRun mode.
+func (e *Environment) ApplyDryRun(namespace, ymlFile string) error {
+	return e.Accessor.ApplyDryRun(namespace, ymlFile)
+}
+
+// Deletes the given yaml contents from the namespace.
+func (e *Environment) DeleteContents(namespace, yml string) error {
+	return e.Accessor.DeleteContents(namespace, yml)
+}
+
+// Deletes the config in the given filename from the namespace.
+func (e *Environment) Delete(namespace, ymlFile string) error {
+	return e.Accessor.Delete(namespace, ymlFile)
+}
+
 func (e *Environment) DeployYaml(namespace, yamlFile string) (*deployment.Instance, error) {
 	i := deployment.NewYamlDeployment(namespace, yamlFile)
 

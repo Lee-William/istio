@@ -24,11 +24,11 @@ import (
 	"istio.io/istio/mixer/pkg/loadshedding"
 	"istio.io/istio/mixer/pkg/runtime/config/constant"
 	"istio.io/istio/mixer/pkg/template"
-	"istio.io/istio/pkg/ctrlz"
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/mcp/creds"
-	"istio.io/istio/pkg/probe"
 	"istio.io/istio/pkg/tracing"
+	"istio.io/pkg/ctrlz"
+	"istio.io/pkg/log"
+	"istio.io/pkg/probe"
 )
 
 // Args contains the startup arguments to instantiate Mixer.
@@ -84,7 +84,7 @@ type Args struct {
 	// The introspection options to use
 	IntrospectionOptions *ctrlz.Options
 
-	// Address to use for Mixer's gRPC API. This setting supercedes the API port setting.
+	// Address to use for Mixer's gRPC API. This setting supersedes the API port setting.
 	APIAddress string
 
 	// Port to use for Mixer's gRPC API
@@ -192,6 +192,7 @@ func (a *Args) String() string {
 	fmt.Fprintf(buf, "IntrospectionOptions: %#v\n", *a.IntrospectionOptions)
 	fmt.Fprintf(buf, "UseTemplateCRDs: %#v\n", a.UseTemplateCRDs)
 	fmt.Fprintf(buf, "LoadSheddingOptions: %#v\n", a.LoadSheddingOptions)
+	fmt.Fprintf(buf, "UseAdapterCRDs: %#v\n", a.UseAdapterCRDs)
 
 	return buf.String()
 }

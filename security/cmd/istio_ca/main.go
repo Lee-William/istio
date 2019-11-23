@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright 2019 Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,14 +25,11 @@ import (
 	"github.com/spf13/cobra/doc"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
-	"istio.io/istio/pkg/collateral"
-	"istio.io/istio/pkg/ctrlz"
-	"istio.io/istio/pkg/env"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	pkgcmd "istio.io/istio/pkg/cmd"
 	kubelib "istio.io/istio/pkg/kube"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/probe"
 	"istio.io/istio/pkg/spiffe"
-	"istio.io/istio/pkg/version"
 	"istio.io/istio/security/pkg/caclient"
 	"istio.io/istio/security/pkg/cmd"
 	"istio.io/istio/security/pkg/k8s/controller"
@@ -42,22 +39,40 @@ import (
 	"istio.io/istio/security/pkg/registry/kube"
 	caserver "istio.io/istio/security/pkg/server/ca"
 	"istio.io/istio/security/pkg/server/monitoring"
+	"istio.io/pkg/collateral"
+	"istio.io/pkg/ctrlz"
+	"istio.io/pkg/env"
+	"istio.io/pkg/log"
+	"istio.io/pkg/probe"
+	"istio.io/pkg/version"
+)
+
+const (
+	selfSignedCaCertTTL                     = "CITADEL_SELF_SIGNED_CA_CERT_TTL"
+	selfSignedRootCertCheckInterval         = "CITADEL_SELF_SIGNED_ROOT_CERT_CHECK_INTERVAL"
+	selfSignedRootCertGracePeriodPercentile = "CITADEL_SELF_SIGNED_ROOT_CERT_GRACE_PERIOD_PERCENTILE"
+	workloadCertMinGracePeriod              = "CITADEL_WORKLOAD_CERT_MIN_GRACE_PERIOD"
+	enableJitterForRootCertRotator          = "CITADEL_ENABLE_JITTER_FOR_ROOT_CERT_ROTATOR"
 )
 
 type cliOptions struct { // nolint: maligned
 	// Comma separated string containing all listened namespaces
-	listenedNamespaces      string
-	istioCaStorageNamespace string
-	kubeConfigFile          string
-	readSigningCertOnly     bool
+	listenedNamespaces        string
+	enableNamespacesByDefault bool
+	istioCaStorageNamespace   string
+	kubeConfigFile            string
+	readSigningCertOnly       bool
 
 	certChainFile   string
 	signingCertFile string
 	signingKeyFile  string
 	rootCertFile    string
 
-	selfSignedCA        bool
-	selfSignedCACertTTL time.Duration
+	selfSignedCA                            bool
+	selfSignedCACertTTL                     time.Duration
+	selfSignedRootCertCheckInterval         time.Duration
+	selfSignedRootCertGracePeriodPercentile int
+	enableJitterForRootCertRotator          bool
 
 	workloadCertTTL    time.Duration
 	maxWorkloadCertTTL time.Duration
@@ -105,6 +120,9 @@ type cliOptions struct { // nolint: maligned
 
 	// Enable dual-use certs - SPIFFE in SAN and in CommonName
 	dualUse bool
+
+	// Whether SDS is enabled on.
+	sdsEnabled bool
 }
 
 var (
@@ -112,6 +130,26 @@ var (
 		loggingOptions:       log.DefaultOptions(),
 		ctrlzOptions:         ctrlz.DefaultOptions(),
 		LivenessProbeOptions: &probe.Options{},
+		selfSignedCACertTTL: env.RegisterDurationVar(selfSignedCaCertTTL,
+			cmd.DefaultSelfSignedCACertTTL,
+			"The TTL of self-signed CA root certificate.").Get(),
+		selfSignedRootCertCheckInterval: env.RegisterDurationVar(selfSignedRootCertCheckInterval,
+			cmd.DefaultSelfSignedRootCertCheckInterval,
+			"The interval that self-signed CA checks its root certificate "+
+				"expiration time and rotates root certificate. Setting this interval "+
+				"to zero or a negative value disables automated root cert check and "+
+				"rotation. This interval is suggested to be larger than 10 minutes.").Get(),
+		selfSignedRootCertGracePeriodPercentile: env.RegisterIntVar(selfSignedRootCertGracePeriodPercentile,
+			cmd.DefaultRootCertGracePeriodPercentile,
+			"Grace period percentile for self-signed root cert.").Get(),
+		workloadCertMinGracePeriod: env.RegisterDurationVar(workloadCertMinGracePeriod,
+			cmd.DefaultWorkloadMinCertGracePeriod,
+			"The minimum workload certificate rotation grace period.").Get(),
+		enableJitterForRootCertRotator: env.RegisterBoolVar(enableJitterForRootCertRotator,
+			true,
+			"If true, set up a jitter to start root cert rotator. "+
+				"Jitter selects a backoff time in seconds to start root cert rotator, "+
+				"and the back off time is below root cert check interval.").Get(),
 	}
 
 	rootCmd = &cobra.Command{
@@ -132,6 +170,8 @@ var (
 		"istio-sidecar-injector",
 		"istio-galley",
 	}
+
+	rootCertRotatorChan chan struct{}
 )
 
 func fatalf(template string, args ...interface{}) {
@@ -144,14 +184,20 @@ func fatalf(template string, args ...interface{}) {
 }
 
 func init() {
+	initCLI()
+	initEnvVars()
+}
+
+func initCLI() {
 	flags := rootCmd.Flags()
 	// General configuration.
-	flags.StringVar(&opts.listenedNamespaces, "listened-namespace", "", "deprecated")
+	flags.StringVar(&opts.listenedNamespaces, "listened-namespace", metav1.NamespaceAll, "deprecated")
 	if err := flags.MarkDeprecated("listened-namespace", "please use --listened-namespaces instead"); err != nil {
 		panic(err)
 	}
 
-	flags.StringVar(&opts.listenedNamespaces, "listened-namespaces", "",
+	// Default to NamespaceAll, which equals to "". Kuberentes library will then watch all the namespace.
+	flags.StringVar(&opts.listenedNamespaces, "listened-namespaces", metav1.NamespaceAll,
 		"Select the namespaces for the Citadel to listen to, separated by comma. If unspecified, Citadel tries to use the ${"+
 			cmd.ListenedNamespaceKey+"} environment variable. If neither is set, Citadel listens to all namespaces.")
 	flags.StringVar(&opts.istioCaStorageNamespace, "citadel-storage-namespace", "istio-system", "Namespace where "+
@@ -160,7 +206,7 @@ func init() {
 	flags.StringVar(&opts.kubeConfigFile, "kube-config", "",
 		"Specifies path to kubeconfig file. This must be specified when not running inside a Kubernetes pod.")
 	flags.BoolVar(&opts.readSigningCertOnly, "read-signing-cert-only", false, "When set, Citadel only reads the self-signed signing "+
-		"key and cert from Kubernetes secret without generating one (if not exist). This flag avoids racing condition between "+
+		"cert and key from Kubernetes secret without generating one (if not exist). This flag avoids racing condition between "+
 		"multiple Citadels generating self-signed key and cert. Please make sure one and only one Citadel instance has this flag set "+
 		"to false.")
 
@@ -176,8 +222,6 @@ func init() {
 	flags.BoolVar(&opts.selfSignedCA, "self-signed-ca", false,
 		"Indicates whether to use auto-generated self-signed CA certificate. "+
 			"When set to true, the '--signing-cert' and '--signing-key' options are ignored.")
-	flags.DurationVar(&opts.selfSignedCACertTTL, "self-signed-ca-cert-ttl", cmd.DefaultSelfSignedCACertTTL,
-		"The TTL of self-signed CA root certificate.")
 	flags.StringVar(&opts.trustDomain, "trust-domain", "",
 		"The domain serves to identify the system with SPIFFE.")
 	// Upstream CA configuration if Citadel interacts with upstream CA.
@@ -196,8 +240,6 @@ func init() {
 	flags.Float32Var(&opts.workloadCertGracePeriodRatio, "workload-cert-grace-period-ratio",
 		cmd.DefaultWorkloadCertGracePeriodRatio, "The workload certificate rotation grace period, as a ratio of the "+
 			"workload certificate TTL.")
-	flags.DurationVar(&opts.workloadCertMinGracePeriod, "workload-cert-min-grace-period",
-		cmd.DefaultWorkloadMinCertGracePeriod, "The minimum workload certificate rotation grace period.")
 
 	// gRPC server for signing CSRs.
 	flags.StringVar(&opts.grpcHosts, "grpc-host-identities", "istio-ca,istio-citadel",
@@ -232,6 +274,8 @@ func init() {
 	flags.BoolVar(&opts.dualUse, "experimental-dual-use",
 		false, "Enable dual-use mode. Generates certificates with a CommonName identical to the SAN.")
 
+	flags.BoolVar(&opts.sdsEnabled, "sds-enabled", false, "Whether SDS is enabled.")
+
 	rootCmd.AddCommand(version.CobraCommand())
 
 	rootCmd.AddCommand(collateral.CobraCommand(rootCmd, &doc.GenManHeader{
@@ -245,7 +289,13 @@ func init() {
 	opts.loggingOptions.AttachCobraFlags(rootCmd)
 	opts.ctrlzOptions.AttachCobraFlags(rootCmd)
 
-	cmd.InitializeFlags(rootCmd)
+	pkgcmd.AddFlags(rootCmd)
+}
+
+func initEnvVars() {
+	enableNamespacesByDefault := env.RegisterBoolVar("CITADEL_ENABLE_NAMESPACES_BY_DEFAULT", true,
+		"Determines whether unlabeled namespaces should be targeted by this Citadel instance").Get()
+	opts.enableNamespacesByDefault = enableNamespacesByDefault
 }
 
 func main() {
@@ -265,6 +315,8 @@ var (
 )
 
 func runCA() {
+	verifyCommandLineOptions()
+
 	if err := log.Configure(opts.loggingOptions); err != nil {
 		fatalf("Failed to configure logging (%v)", err)
 	}
@@ -276,13 +328,9 @@ func runCA() {
 		if opts.listenedNamespaces == "" {
 			opts.listenedNamespaces = value
 		}
-		// Use environment variable for istioCaStorageNamespace if it exists
-		opts.istioCaStorageNamespace = value
 	}
 
 	listenedNamespaces := strings.Split(opts.listenedNamespaces, ",")
-
-	verifyCommandLineOptions()
 
 	var webhooks map[string]*controller.DNSNameEntry
 	if opts.appendDNSNames {
@@ -300,10 +348,10 @@ func runCA() {
 	if !opts.serverOnly {
 		log.Infof("Creating Kubernetes controller to write issued keys and certs into secret ...")
 		// For workloads in K8s, we apply the configured workload cert TTL.
-		sc, err := controller.NewSecretController(ca,
-			opts.workloadCertTTL,
-			opts.workloadCertGracePeriodRatio, opts.workloadCertMinGracePeriod, opts.dualUse,
-			cs.CoreV1(), opts.signCACerts, opts.pkcs8Keys, listenedNamespaces, webhooks)
+		sc, err := controller.NewSecretController(ca, opts.enableNamespacesByDefault,
+			opts.workloadCertTTL, opts.workloadCertGracePeriodRatio, opts.workloadCertMinGracePeriod,
+			opts.dualUse, cs.CoreV1(), opts.signCACerts, opts.pkcs8Keys, listenedNamespaces, webhooks,
+			opts.istioCaStorageNamespace, opts.rootCertFile, opts.selfSignedCA)
 		if err != nil {
 			fatalf("Failed to create secret controller: %v", err)
 		}
@@ -322,7 +370,7 @@ func runCA() {
 		// add certificate identity to the identity registry for the liveness probe check
 		if registryErr := reg.AddMapping(probecontroller.LivenessProbeClientIdentity,
 			probecontroller.LivenessProbeClientIdentity); registryErr != nil {
-			log.Errorf("Failed to add indentity mapping: %v", registryErr)
+			log.Errorf("Failed to add identity mapping: %v", registryErr)
 		}
 
 		ch := make(chan struct{})
@@ -338,7 +386,9 @@ func runCA() {
 
 		// The CA API uses cert with the max workload cert TTL.
 		hostnames := append(strings.Split(opts.grpcHosts, ","), fqdn())
-		caServer, startErr := caserver.New(ca, opts.maxWorkloadCertTTL, opts.signCACerts, hostnames, opts.grpcPort, spiffe.GetTrustDomain())
+		caServer, startErr := caserver.New(ca, opts.maxWorkloadCertTTL,
+			opts.signCACerts, hostnames, opts.grpcPort, spiffe.GetTrustDomain(),
+			opts.sdsEnabled)
 		if startErr != nil {
 			fatalf("Failed to create istio ca server: %v", startErr)
 		}
@@ -390,9 +440,9 @@ func runCA() {
 	// Blocking until receives error.
 	for {
 		select {
-		case <-monitorErrCh:
+		case err := <-monitorErrCh:
 			fatalf("Monitoring server error: %v", err)
-		case <-rotatorErrCh:
+		case err := <-rotatorErrCh:
 			fatalf("Key cert bundle rotator error: %v", err)
 		}
 	}
@@ -410,13 +460,16 @@ func createCA(client corev1.CoreV1Interface) *ca.IstioCA {
 		defer cancel()
 		var checkInterval time.Duration
 		if opts.readSigningCertOnly {
-			checkInterval = ca.ReadSigningCertCheckInterval
+			checkInterval = cmd.ReadSigningCertRetryInterval
 		} else {
 			checkInterval = -1
 		}
-		caOpts, err = ca.NewSelfSignedIstioCAOptions(ctx, opts.selfSignedCACertTTL, opts.workloadCertTTL,
+		caOpts, err = ca.NewSelfSignedIstioCAOptions(ctx,
+			opts.selfSignedRootCertGracePeriodPercentile, opts.selfSignedCACertTTL,
+			opts.selfSignedRootCertCheckInterval, opts.workloadCertTTL,
 			opts.maxWorkloadCertTTL, spiffe.GetTrustDomain(), opts.dualUse,
-			opts.istioCaStorageNamespace, checkInterval, client, opts.rootCertFile)
+			opts.istioCaStorageNamespace, checkInterval, client, opts.rootCertFile,
+			opts.enableJitterForRootCertRotator)
 		if err != nil {
 			fatalf("Failed to create a self-signed Citadel (error: %v)", err)
 		}
@@ -447,6 +500,12 @@ func createCA(client corev1.CoreV1Interface) *ca.IstioCA {
 			livenessProbeChecker.Run()
 		}
 	}
+	// rootCertRotatorChan channel accepts signals to stop root cert rotator for
+	// self-signed CA.
+	rootCertRotatorChan = make(chan struct{})
+	// Start root cert rotator in a separate goroutine.
+	istioCA.Run(rootCertRotatorChan)
+	go pkgcmd.WaitSignal(rootCertRotatorChan)
 
 	return istioCA
 }

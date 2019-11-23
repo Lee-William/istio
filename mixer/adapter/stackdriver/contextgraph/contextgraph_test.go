@@ -19,13 +19,13 @@ import (
 	"testing"
 	"time"
 
-	contextgraph "cloud.google.com/go/contextgraph/apiv1alpha1"
 	gax "github.com/googleapis/gax-go"
 	"google.golang.org/api/option"
-	contextgraphpb "google.golang.org/genproto/googleapis/cloud/contextgraph/v1alpha1"
 
 	"istio.io/istio/mixer/adapter/stackdriver/config"
 	"istio.io/istio/mixer/adapter/stackdriver/helper"
+	contextgraph "istio.io/istio/mixer/adapter/stackdriver/internal/cloud.google.com/go/contextgraph/apiv1alpha1"
+	contextgraphpb "istio.io/istio/mixer/adapter/stackdriver/internal/google.golang.org/genproto/googleapis/cloud/contextgraph/v1alpha1"
 	env "istio.io/istio/mixer/pkg/adapter/test"
 	edgepb "istio.io/istio/mixer/template/edge"
 )
@@ -102,6 +102,7 @@ func TestBuild(t *testing.T) {
 		projectID: "myid",
 		zone:      "myzone",
 		cluster:   "mycluster",
+		cfg:       &config.Params{ProjectId: "myid"},
 	}
 
 	mEnv := env.NewEnv(t)
@@ -136,6 +137,29 @@ func TestBuild(t *testing.T) {
 
 	if h.meshUID != "myid/myzone/mycluster" {
 		t.Errorf("Expected mesh uid to be : myid/myzone/mycluster, got: %s", h.meshUID)
+	}
+}
+
+func TestBuildWithMeshID(t *testing.T) {
+	m := &mockNC{}
+	b := &builder{
+		newClient: m.NewClient,
+		projectID: "myid",
+		zone:      "myzone",
+		cluster:   "mycluster",
+		cfg:       &config.Params{ProjectId: "myid", MeshUid: "what-a-mesh"},
+	}
+
+	mEnv := env.NewEnv(t)
+
+	han, err := b.Build(context.TODO(), mEnv)
+	h := han.(*handler)
+	if err != nil {
+		t.Errorf("Build returned unexpected err: %v", err)
+	}
+
+	if got, want := h.meshUID, "what-a-mesh"; got != want {
+		t.Errorf("handler.meshUID: got %q, want %q", got, want)
 	}
 }
 

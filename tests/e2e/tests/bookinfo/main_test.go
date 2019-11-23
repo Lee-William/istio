@@ -32,9 +32,9 @@ import (
 	multierror "github.com/hashicorp/go-multierror"
 	"golang.org/x/net/publicsuffix"
 
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/tests/e2e/framework"
 	"istio.io/istio/tests/util"
+	"istio.io/pkg/log"
 )
 
 const (
@@ -293,43 +293,43 @@ func checkRoutingResponse(jar *cookiejar.Jar, version, gateway, modelFile string
 	return duration, err
 }
 
-func checkHTTPResponse(gateway, expr string, count int) (int, error) {
+func checkHTTPResponse(gateway, expr string, count int) error {
 	resp, err := http.Get(fmt.Sprintf("%s/productpage", gateway))
 	if err != nil {
-		return -1, err
+		return err
 	}
 
 	defer closeResponseBody(resp)
 	log.Infof("Get from page: %d", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		log.Errorf("Get response from product page failed!")
-		return -1, fmt.Errorf("status code is %d", resp.StatusCode)
+		return fmt.Errorf("status code is %d", resp.StatusCode)
 	}
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return -1, err
+		return err
 	}
 
 	if expr == "" {
-		return 1, nil
+		return nil
 	}
 
 	re, err := regexp.Compile(expr)
 	if err != nil {
-		return -1, err
+		return err
 	}
 
 	ref := re.FindAll(body, -1)
 	if ref == nil {
 		log.Infof("%v", string(body))
-		return -1, fmt.Errorf("could not find %v in response", expr)
+		return fmt.Errorf("could not find %v in response", expr)
 	}
 	if count > 0 && len(ref) < count {
 		log.Infof("%v", string(body))
-		return -1, fmt.Errorf("could not find %v # of %v in response. found %v", count, expr, len(ref))
+		return fmt.Errorf("could not find %v # of %v in response. found %v", count, expr, len(ref))
 	}
-	return 1, nil
+	return nil
 }
 
 func deleteRules(configVersion string, ruleKeys []string) error {
@@ -349,7 +349,6 @@ func applyRules(configVersion string, ruleKeys []string) error {
 	for _, ruleKey := range ruleKeys {
 		rule := getPreprocessedRulePath(tc, configVersion, ruleKey)
 		if err := util.KubeApply(tc.Kube.Namespace, rule, tc.Kube.KubeConfig); err != nil {
-			//log.Errorf("Kubectl apply %s failed", rule)
 			return err
 		}
 	}

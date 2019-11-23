@@ -15,8 +15,9 @@ rules:
   - namespaces
   - nodes
   - pods
-  - services
+  - pods/log
   - replicationcontrollers
+  - services
   verbs:
   - get
   - list
@@ -24,8 +25,8 @@ rules:
 - apiGroups: ["extensions", "apps"]
   resources:
   - deployments
-  - statefulsets
   - replicasets
+  - statefulsets
   verbs:
   - get
   - list
@@ -45,71 +46,13 @@ rules:
   - get
   - list
   - watch
-- apiGroups: ["config.istio.io"]
-  resources:
-  - apikeys
-  - authorizations
-  - checknothings
-  - circonuses
-  - deniers
-  - fluentds
-  - handlers
-  - kubernetesenvs
-  - kuberneteses
-  - listcheckers
-  - listentries
-  - logentries
-  - memquotas
-  - metrics
-  - opas
-  - prometheuses
-  - quotas
-  - quotaspecbindings
-  - quotaspecs
-  - rbacs
-  - reportnothings
-  - rules
-  - solarwindses
-  - stackdrivers
-  - statsds
-  - stdios
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups: ["networking.istio.io"]
-  resources:
-  - destinationrules
-  - gateways
-  - serviceentries
-  - virtualservices
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups: ["authentication.istio.io"]
-  resources:
-  - policies
-  - meshpolicies
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups: ["rbac.istio.io"]
-  resources:
-  - clusterrbacconfigs
-  - rbacconfigs
-  - serviceroles
-  - servicerolebindings
+- apiGroups:
+  - config.istio.io
+  - networking.istio.io
+  - authentication.istio.io
+  - rbac.istio.io
+  - security.istio.io
+  resources: ["*"]
   verbs:
   - create
   - delete
@@ -122,6 +65,7 @@ rules:
   - monitoringdashboards
   verbs:
   - get
+  - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -140,8 +84,9 @@ rules:
   - namespaces
   - nodes
   - pods
-  - services
+  - pods/log
   - replicationcontrollers
+  - services
   verbs:
   - get
   - list
@@ -149,8 +94,8 @@ rules:
 - apiGroups: ["extensions", "apps"]
   resources:
   - deployments
-  - statefulsets
   - replicasets
+  - statefulsets
   verbs:
   - get
   - list
@@ -170,64 +115,13 @@ rules:
   - get
   - list
   - watch
-- apiGroups: ["config.istio.io"]
-  resources:
-  - apikeys
-  - authorizations
-  - checknothings
-  - circonuses
-  - deniers
-  - fluentds
-  - handlers
-  - kubernetesenvs
-  - kuberneteses
-  - listcheckers
-  - listentries
-  - logentries
-  - memquotas
-  - metrics
-  - opas
-  - prometheuses
-  - quotas
-  - quotaspecbindings
-  - quotaspecs
-  - rbacs
-  - reportnothings
-  - rules
-  - servicecontrolreports
-  - servicecontrols
-  - solarwindses
-  - stackdrivers
-  - statsds
-  - stdios
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups: ["networking.istio.io"]
-  resources:
-  - destinationrules
-  - gateways
-  - serviceentries
-  - virtualservices
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups: ["authentication.istio.io"]
-  resources:
-  - policies
-  - meshpolicies
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups: ["rbac.istio.io"]
-  resources:
-  - clusterrbacconfigs
-  - rbacconfigs
-  - serviceroles
-  - servicerolebindings
+- apiGroups:
+  - config.istio.io
+  - networking.istio.io
+  - authentication.istio.io
+  - rbac.istio.io
+  - security.istio.io
+  resources: ["*"]
   verbs:
   - get
   - list
@@ -237,3 +131,4 @@ rules:
   - monitoringdashboards
   verbs:
   - get
+  - list

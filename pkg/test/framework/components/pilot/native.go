@@ -15,27 +15,37 @@
 package pilot
 
 import (
+	"errors"
 	"io"
 	"net"
+	"time"
 
-	"github.com/hashicorp/go-multierror"
+	multierror "github.com/hashicorp/go-multierror"
 
-	meshconfig "istio.io/api/mesh/v1alpha1"
+	meshapi "istio.io/api/mesh/v1alpha1"
+
 	"istio.io/istio/pilot/pkg/bootstrap"
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/proxy/envoy"
+	"istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
+	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/framework/components/environment/native"
 	"istio.io/istio/pkg/test/framework/resource"
+	"istio.io/istio/pkg/test/scopes"
 )
 
 var _ Instance = &nativeComponent{}
 var _ io.Closer = &nativeComponent{}
 var _ Native = &nativeComponent{}
 
+var (
+	pilotCertDir = env.IstioSrc + "/tests/testdata/certs/pilot"
+)
+
 // Native is the interface for an native pilot server.
 type Native interface {
 	Instance
 	GetDiscoveryAddress() *net.TCPAddr
+	GetSecureDiscoveryAddress() *net.TCPAddr
 }
 
 type nativeComponent struct {
@@ -43,33 +53,52 @@ type nativeComponent struct {
 
 	environment *native.Environment
 	*client
-	model.ConfigStoreCache
 	server   *bootstrap.Server
 	stopChan chan struct{}
 	config   Config
 }
 
 // NewNativeComponent factory function for the component
-func newNative(ctx resource.Context, config Config) (Instance, error) {
+func newNative(ctx resource.Context, cfg Config) (Instance, error) {
+	if cfg.Galley == nil {
+		return nil, errors.New("galley must be provided")
+	}
+
+	e := ctx.Environment().(*native.Environment)
 	instance := &nativeComponent{
 		environment: ctx.Environment().(*native.Environment),
 		stopChan:    make(chan struct{}),
-		config:      config,
+		config:      cfg,
 	}
 	instance.id = ctx.TrackResource(instance)
 
+	// Override the default pilot cert dir.
+	// TODO(nmittler): We should eventually replace this hack.
+	bootstrap.PilotCertDir = pilotCertDir
+
 	// Dynamically assign all ports.
-	options := envoy.DiscoveryServiceOptions{
+	options := bootstrap.DiscoveryServiceOptions{
 		HTTPAddr:       ":0",
 		MonitoringAddr: ":0",
 		GrpcAddr:       ":0",
-		SecureGrpcAddr: "",
+		SecureGrpcAddr: ":0",
+	}
+
+	tmpMesh := mesh.DefaultMeshConfig()
+	m := &tmpMesh
+	if cfg.MeshConfig != nil {
+		m = cfg.MeshConfig
 	}
 
 	bootstrapArgs := bootstrap.PilotArgs{
-		Namespace:        "istio-system",
+		Namespace:        e.SystemNamespace,
 		DiscoveryOptions: options,
-		MeshConfig:       instance.environment.Mesh,
+		Config: bootstrap.ConfigArgs{
+			ControllerOptions: controller.Options{
+				DomainSuffix: e.Domain,
+			},
+		},
+		MeshConfig: m,
 		// Use the config store for service entries as well.
 		Service: bootstrap.ServiceArgs{
 			// A ServiceEntry registry is added by default, which is what we want. Don't include any other registries.
@@ -80,23 +109,18 @@ func newNative(ctx resource.Context, config Config) (Instance, error) {
 		ForceStop: true,
 	}
 
-	if config.Galley != nil {
-		if bootstrapArgs.MeshConfig == nil {
-			bootstrapArgs.MeshConfig = &meshconfig.MeshConfig{}
-		}
-		// Set as MCP address, note needs to strip 'tcp://' from the address prefix
-		bootstrapArgs.MeshConfig.ConfigSources = []*meshconfig.ConfigSource{
-			&meshconfig.ConfigSource{Address: config.Galley.Address()[6:]},
-		}
-		bootstrapArgs.MCPMaxMessageSize = bootstrap.DefaultMCPMaxMsgSize
-	} else {
-		bootstrapArgs.Config = bootstrap.ConfigArgs{
-			Controller: instance.environment.ServiceManager.ConfigStore,
-		}
+	if bootstrapArgs.MeshConfig == nil {
+		bootstrapArgs.MeshConfig = &meshapi.MeshConfig{}
 	}
 
-	// Save the config store.
-	instance.ConfigStoreCache = instance.environment.ServiceManager.ConfigStore
+	galleyHostPort := cfg.Galley.Address()[6:]
+	// Set as MCP address, note needs to strip 'tcp://' from the address prefix
+	// Also appending incase if there are existing config sources
+	bootstrapArgs.MeshConfig.ConfigSources = append(bootstrapArgs.MeshConfig.ConfigSources, &meshapi.ConfigSource{
+		Address: galleyHostPort,
+	})
+
+	bootstrapArgs.MCPMaxMessageSize = 1024 * 1024 * 4
 
 	var err error
 	// Create the server for the discovery service.
@@ -104,12 +128,13 @@ func newNative(ctx resource.Context, config Config) (Instance, error) {
 		return nil, err
 	}
 
-	if instance.client, err = newClient(instance.server.GRPCListeningAddr.(*net.TCPAddr)); err != nil {
+	// Start the server
+	if err = instance.server.Start(instance.stopChan); err != nil {
 		return nil, err
 	}
 
-	// Start the server
-	if err = instance.server.Start(instance.stopChan); err != nil {
+	time.Sleep(1 * time.Second)
+	if instance.client, err = newClient(instance.server.GRPCListeningAddr.(*net.TCPAddr)); err != nil {
 		return nil, err
 	}
 
@@ -123,16 +148,25 @@ func (c *nativeComponent) ID() resource.ID {
 
 func (c *nativeComponent) Close() (err error) {
 	if c.client != nil {
+		scopes.Framework.Debugf("%s closing client", c.id)
 		err = multierror.Append(err, c.client.Close()).ErrorOrNil()
 	}
 
 	if c.stopChan != nil {
+		scopes.Framework.Debugf("%s stopping Pilot server", c.id)
 		close(c.stopChan)
 	}
+
+	scopes.Framework.Debugf("%s close complete (err:%v)", c.id, err)
 	return
 }
 
 // GetDiscoveryAddress gets the discovery address for pilot.
 func (c *nativeComponent) GetDiscoveryAddress() *net.TCPAddr {
 	return c.server.GRPCListeningAddr.(*net.TCPAddr)
+}
+
+// GetSecureDiscoveryAddress gets the discovery address for pilot.
+func (c *nativeComponent) GetSecureDiscoveryAddress() *net.TCPAddr {
+	return c.server.SecureGRPCListeningAddr.(*net.TCPAddr)
 }

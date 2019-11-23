@@ -18,17 +18,18 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/user"
 	"testing"
 	"time"
 
-	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-multierror"
 
-	"istio.io/istio/pilot/pkg/config/kube/crd"
+	crd "istio.io/istio/pilot/pkg/config/kube/crd/controller"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/serviceregistry/kube"
+	kube "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pilot/test/mock"
 	"istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config/schemas"
 )
 
 // Package controller tests the pilot controller using a k8s cluster or standalone apiserver.
@@ -43,8 +44,8 @@ const (
 	resync = 1 * time.Second
 )
 
-func makeClient(desc model.ConfigDescriptor) (*crd.Client, error) {
-	cl, err := crd.NewClient("", "", desc, "")
+func makeClient(desc schema.Set) (*crd.Client, error) {
+	cl, err := crd.NewClient("", "", desc, "", &model.DisabledLedger{})
 	if err != nil {
 		return nil, err
 	}
@@ -68,13 +69,11 @@ func resolveConfig(kubeconfig string) (string, error) {
 		kubeconfig = os.Getenv("KUBECONFIG")
 	}
 	if kubeconfig == "" {
-		usr, err := user.Current()
-		if err == nil {
-			defaultCfg := usr.HomeDir + "/.kube/config"
-			_, err := os.Stat(kubeconfig)
-			if err != nil {
-				kubeconfig = defaultCfg
-			}
+		home := os.Getenv("HOME")
+		defaultCfg := home + "/.kube/config"
+		_, err := os.Stat(kubeconfig)
+		if err != nil {
+			kubeconfig = defaultCfg
 		}
 	}
 	if kubeconfig != "" {
@@ -111,7 +110,7 @@ func makeTempClient(t *testing.T) (*crd.Client, string, func()) {
 	if err != nil {
 		t.Fatal(err.Error())
 	}
-	desc := append(model.IstioConfigTypes, mock.Types...)
+	desc := append(schemas.Istio, mock.Types...)
 	cl, err := makeClient(desc)
 	if err != nil {
 		t.Fatalf(err.Error())
@@ -154,7 +153,7 @@ func istioConfig(t *testing.T, client model.ConfigStore, ns string) {
 }
 
 func TestUnknownConfig(t *testing.T) {
-	desc := model.ConfigDescriptor{model.ProtoSchema{
+	desc := schema.Set{schema.Instance{
 		Type:        "unknown-config",
 		Plural:      "unknown-configs",
 		Group:       "test",
@@ -169,16 +168,16 @@ func TestUnknownConfig(t *testing.T) {
 }
 
 func controllerEvents(t *testing.T, cl *crd.Client, ns string) {
-	ctl := crd.NewController(cl, kube.ControllerOptions{WatchedNamespace: ns, ResyncPeriod: resync})
+	ctl := crd.NewController(cl, kube.Options{WatchedNamespace: ns, ResyncPeriod: resync})
 	mock.CheckCacheEvents(cl, ctl, ns, 5, t)
 }
 
 func controllerCacheFreshness(t *testing.T, cl *crd.Client, ns string) {
-	ctl := crd.NewController(cl, kube.ControllerOptions{WatchedNamespace: ns, ResyncPeriod: resync})
+	ctl := crd.NewController(cl, kube.Options{WatchedNamespace: ns, ResyncPeriod: resync})
 	mock.CheckCacheFreshness(ctl, ns, t)
 }
 
 func controllerClientSync(t *testing.T, cl *crd.Client, ns string) {
-	ctl := crd.NewController(cl, kube.ControllerOptions{WatchedNamespace: ns, ResyncPeriod: resync})
+	ctl := crd.NewController(cl, kube.Options{WatchedNamespace: ns, ResyncPeriod: resync})
 	mock.CheckCacheSync(cl, ctl, ns, 5, t)
 }

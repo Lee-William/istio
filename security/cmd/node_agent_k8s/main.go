@@ -20,19 +20,21 @@ import (
 	"strings"
 	"time"
 
+	"istio.io/pkg/ctrlz"
+
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"istio.io/istio/pkg/cmd"
-	"istio.io/istio/pkg/collateral"
-	"istio.io/istio/pkg/env"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/version"
 	"istio.io/istio/security/pkg/nodeagent/cache"
 	"istio.io/istio/security/pkg/nodeagent/sds"
 	"istio.io/istio/security/pkg/nodeagent/secretfetcher"
-
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"istio.io/istio/security/pkg/server/monitoring"
+	"istio.io/pkg/collateral"
+	"istio.io/pkg/env"
+	"istio.io/pkg/log"
+	"istio.io/pkg/version"
 )
 
 const (
@@ -45,12 +47,12 @@ const (
 	caEndpointFlag = "caEndpoint"
 
 	// names of authentication provider's plugins.
-	pluginNames     = "Plugins"
+	pluginNames     = "PLUGINS"
 	pluginNamesFlag = "pluginNames"
 
 	// The trust domain corresponds to the trust root of a system.
 	// Refer to https://github.com/spiffe/spiffe/blob/master/standards/SPIFFE-ID.md#21-trust-domain
-	trustDomain     = "Trust_Domain"
+	trustDomain     = "TRUST_DOMAIN"
 	trustDomainFlag = "trustDomain"
 
 	// The workload SDS mode allows node agent to provision credentials to workload proxy by sending
@@ -88,6 +90,10 @@ const (
 	alwaysValidTokenFlag     = "VALID_TOKEN"
 	alwaysValidTokenFlagFlag = "alwaysValidTokenFlag"
 
+	// The environmental variable name for the flag which is used to indicate whether to
+	// validate the certificate's format which is returned by CA.
+	skipValidateCertFlag = "SKIP_CERT_VALIDATION"
+
 	// The environmental variable name for secret TTL, node agent decides whether a secret
 	// is expired if time.now - secret.createtime >= secretTTL.
 	// example value format like "90m"
@@ -104,6 +110,19 @@ const (
 	// example value format like "20m"
 	SecretRotationInterval     = "SECRET_JOB_RUN_INTERVAL"
 	secretRotationIntervalFlag = "secretRotationInterval"
+
+	// The environmental variable name for staled connection recycle job running interval.
+	// example value format like "5m"
+	staledConnectionRecycleInterval = "STALED_CONNECTION_RECYCLE_RUN_INTERVAL"
+
+	// The environmental variable name for the initial backoff in milliseconds.
+	// example value format like "10"
+	InitialBackoff     = "INITIAL_BACKOFF_MSEC"
+	InitialBackoffFlag = "initialBackoff"
+
+	MonitoringPort  = "MONITORING_PORT"
+	EnableProfiling = "ENABLE_PROFILING"
+	DebugPort       = "DEBUG_PORT"
 )
 
 var (
@@ -112,32 +131,22 @@ var (
 	serverOptions           sds.Options
 	gatewaySecretChan       chan struct{}
 	loggingOptions          = log.DefaultOptions()
-
+	ctrlzOptions            = ctrlz.DefaultOptions()
 	// rootCmd defines the command for node agent.
 	rootCmd = &cobra.Command{
 		Use:   "nodeagent",
-		Short: "Node agent",
+		Short: "Citadel agent",
 		RunE: func(c *cobra.Command, args []string) error {
 			if err := log.Configure(loggingOptions); err != nil {
 				return err
 			}
 
 			applyEnvVars(c)
-
+			_, _ = ctrlz.Run(ctrlzOptions, nil)
 			gatewaySdsCacheOptions = workloadSdsCacheOptions
 
-			if serverOptions.EnableIngressGatewaySDS && serverOptions.EnableWorkloadSDS &&
-				serverOptions.IngressGatewayUDSPath == serverOptions.WorkloadUDSPath {
-				log.Error("UDS paths for ingress gateway and workload are the same")
-				os.Exit(1)
-			}
-			if serverOptions.CAProviderName == "" && serverOptions.EnableWorkloadSDS {
-				log.Error("CA Provider is missing")
-				os.Exit(1)
-			}
-			if serverOptions.CAEndpoint == "" && serverOptions.EnableWorkloadSDS {
-				log.Error("CA Endpoint is missing")
-				os.Exit(1)
+			if err := validateOptions(); err != nil {
+				return err
 			}
 
 			stop := make(chan struct{})
@@ -151,11 +160,25 @@ var (
 			}
 
 			server, err := sds.NewServer(serverOptions, workloadSecretCache, gatewaySecretCache)
-			defer server.Stop()
 			if err != nil {
 				log.Errorf("failed to create sds service: %v", err)
 				return fmt.Errorf("failed to create sds service")
 			}
+			defer server.Stop()
+
+			monitorErrCh := make(chan error)
+			// Start the monitoring server.
+			if monitoringPortEnv > 0 {
+				monitor, mErr := monitoring.NewMonitor(monitoringPortEnv, enableProfilingEnv)
+				if mErr != nil {
+					return fmt.Errorf("unable to setup monitoring: %v", mErr)
+				}
+				go monitor.Start(monitorErrCh)
+				log.Info("citadel agent monitor has started.")
+				defer monitor.Close()
+			}
+
+			go exitOnMonitorServerError(monitorErrCh)
 
 			cmd.WaitSignal(stop)
 
@@ -164,6 +187,16 @@ var (
 	}
 )
 
+// exitOnMonitorServerError shuts down Citadel agent when monitor server stops and returns an error.
+func exitOnMonitorServerError(errCh <-chan error) {
+	if err := <-errCh; err != nil {
+		log.Errorf("Monitoring server error: %v, terminate", err)
+		os.Exit(-1)
+	}
+}
+
+// newSecretCache creates the cache for workload secrets and/or gateway secrets.
+// Although currently not used, Citadel Agent can serve both workload and gateway secrets at the same time.
 func newSecretCache(serverOptions sds.Options) (workloadSecretCache, gatewaySecretCache *cache.SecretCache) {
 	if serverOptions.EnableWorkloadSDS {
 		wSecretFetcher, err := secretfetcher.NewSecretFetcher(false, serverOptions.CAEndpoint,
@@ -197,21 +230,30 @@ func newSecretCache(serverOptions sds.Options) (workloadSecretCache, gatewaySecr
 }
 
 var (
-	pluginNamesEnv                = env.RegisterStringVar(pluginNames, "", "").Get()
-	enableWorkloadSDSEnv          = env.RegisterBoolVar(enableWorkloadSDS, true, "").Get()
-	enableIngressGatewaySDSEnv    = env.RegisterBoolVar(enableIngressGatewaySDS, false, "").Get()
-	alwaysValidTokenFlagEnv       = env.RegisterBoolVar(alwaysValidTokenFlag, false, "").Get()
-	caProviderEnv                 = env.RegisterStringVar(caProvider, "", "").Get()
-	caEndpointEnv                 = env.RegisterStringVar(caEndpoint, "", "").Get()
-	trustDomainEnv                = env.RegisterStringVar(trustDomain, "", "").Get()
-	vaultAddressEnv               = env.RegisterStringVar(vaultAddress, "", "").Get()
-	vaultRoleEnv                  = env.RegisterStringVar(vaultRole, "", "").Get()
-	vaultAuthPathEnv              = env.RegisterStringVar(vaultAuthPath, "", "").Get()
-	vaultSignCsrPathEnv           = env.RegisterStringVar(vaultSignCsrPath, "", "").Get()
-	vaultTLSRootCertEnv           = env.RegisterStringVar(vaultTLSRootCert, "", "").Get()
-	secretTTLEnv                  = env.RegisterDurationVar(secretTTL, 24*time.Hour, "").Get()
-	secretRefreshGraceDurationEnv = env.RegisterDurationVar(SecretRefreshGraceDuration, 1*time.Hour, "").Get()
-	secretRotationIntervalEnv     = env.RegisterDurationVar(SecretRotationInterval, 10*time.Minute, "").Get()
+	pluginNamesEnv                     = env.RegisterStringVar(pluginNames, "", "").Get()
+	enableWorkloadSDSEnv               = env.RegisterBoolVar(enableWorkloadSDS, true, "").Get()
+	enableIngressGatewaySDSEnv         = env.RegisterBoolVar(enableIngressGatewaySDS, false, "").Get()
+	alwaysValidTokenFlagEnv            = env.RegisterBoolVar(alwaysValidTokenFlag, false, "").Get()
+	skipValidateCertFlagEnv            = env.RegisterBoolVar(skipValidateCertFlag, false, "").Get()
+	caProviderEnv                      = env.RegisterStringVar(caProvider, "", "").Get()
+	caEndpointEnv                      = env.RegisterStringVar(caEndpoint, "", "").Get()
+	trustDomainEnv                     = env.RegisterStringVar(trustDomain, "", "").Get()
+	vaultAddressEnv                    = env.RegisterStringVar(vaultAddress, "", "").Get()
+	vaultRoleEnv                       = env.RegisterStringVar(vaultRole, "", "").Get()
+	vaultAuthPathEnv                   = env.RegisterStringVar(vaultAuthPath, "", "").Get()
+	vaultSignCsrPathEnv                = env.RegisterStringVar(vaultSignCsrPath, "", "").Get()
+	vaultTLSRootCertEnv                = env.RegisterStringVar(vaultTLSRootCert, "", "").Get()
+	secretTTLEnv                       = env.RegisterDurationVar(secretTTL, 24*time.Hour, "").Get()
+	secretRefreshGraceDurationEnv      = env.RegisterDurationVar(SecretRefreshGraceDuration, 1*time.Hour, "").Get()
+	secretRotationIntervalEnv          = env.RegisterDurationVar(SecretRotationInterval, 10*time.Minute, "").Get()
+	staledConnectionRecycleIntervalEnv = env.RegisterDurationVar(staledConnectionRecycleInterval, 5*time.Minute, "").Get()
+	initialBackoffEnv                  = env.RegisterIntVar(InitialBackoff, 10, "").Get()
+	monitoringPortEnv                  = env.RegisterIntVar(MonitoringPort, 15014,
+		"The port number for monitoring Citadel agent").Get()
+	debugPortEnv = env.RegisterIntVar(DebugPort, 8080,
+		"Debug endpoints dump SDS configuration and connection data from this port").Get()
+	enableProfilingEnv = env.RegisterBoolVar(EnableProfiling, true,
+		"Enabling profiling when monitoring Citadel agent").Get()
 )
 
 func applyEnvVars(cmd *cobra.Command) {
@@ -274,6 +316,42 @@ func applyEnvVars(cmd *cobra.Command) {
 	if !cmd.Flag(secretRotationIntervalFlag).Changed {
 		workloadSdsCacheOptions.RotationInterval = secretRotationIntervalEnv
 	}
+
+	if !cmd.Flag(skipValidateCertFlag).Changed {
+		workloadSdsCacheOptions.SkipValidateCert = skipValidateCertFlagEnv
+	}
+
+	serverOptions.RecycleInterval = staledConnectionRecycleIntervalEnv
+
+	if !cmd.Flag(InitialBackoffFlag).Changed {
+		workloadSdsCacheOptions.InitialBackoff = int64(initialBackoffEnv)
+	}
+
+	serverOptions.DebugPort = debugPortEnv
+}
+
+func validateOptions() error {
+	// The initial backoff time (in millisec) is a random number between 0 and initBackoff.
+	// Default to 10, a valid range is [10, 120000].
+	initBackoff := workloadSdsCacheOptions.InitialBackoff
+	if initBackoff < 10 || initBackoff > 120000 {
+		return fmt.Errorf("initial backoff should be within range 10 to 120000, found: %d", initBackoff)
+	}
+
+	if serverOptions.EnableIngressGatewaySDS && serverOptions.EnableWorkloadSDS &&
+		serverOptions.IngressGatewayUDSPath == serverOptions.WorkloadUDSPath {
+		return fmt.Errorf("UDS paths for ingress gateway and workload cannot be the same: %s", serverOptions.IngressGatewayUDSPath)
+	}
+
+	if serverOptions.EnableWorkloadSDS {
+		if serverOptions.CAProviderName == "" {
+			return fmt.Errorf("CA provider cannot be empty when workload SDS is enabled")
+		}
+		if serverOptions.CAEndpoint == "" {
+			return fmt.Errorf("CA endpoint cannot be empty when workload SDS is enabled")
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -307,12 +385,19 @@ func main() {
 	rootCmd.PersistentFlags().DurationVar(&workloadSdsCacheOptions.RotationInterval, secretRotationIntervalFlag,
 		10*time.Minute, "Secret rotation job running interval")
 
+	rootCmd.PersistentFlags().Int64Var(&workloadSdsCacheOptions.InitialBackoff, InitialBackoffFlag, 10,
+		"The initial backoff interval in milliseconds, must be within the range [10, 120000]")
+
 	rootCmd.PersistentFlags().DurationVar(&workloadSdsCacheOptions.EvictionDuration, "secretEvictionDuration",
 		24*time.Hour, "Secret eviction time duration")
 
 	rootCmd.PersistentFlags().BoolVar(&workloadSdsCacheOptions.AlwaysValidTokenFlag, alwaysValidTokenFlagFlag,
 		false,
 		"If true, node agent assume token passed from envoy is always valid.")
+
+	rootCmd.PersistentFlags().BoolVar(&workloadSdsCacheOptions.SkipValidateCert, skipValidateCertFlag,
+		false,
+		"If true, node agent skip validating format of certificate returned from CA.")
 
 	rootCmd.PersistentFlags().StringVar(&serverOptions.VaultAddress, vaultAddressFlag, "",
 		"Vault address")
@@ -327,6 +412,8 @@ func main() {
 
 	// Attach the Istio logging options to the command.
 	loggingOptions.AttachCobraFlags(rootCmd)
+	// Attach Ctrlz options to the command.
+	ctrlzOptions.AttachCobraFlags(rootCmd)
 
 	rootCmd.AddCommand(version.CobraCommand())
 	rootCmd.AddCommand(collateral.CobraCommand(rootCmd, &doc.GenManHeader{
@@ -334,8 +421,6 @@ func main() {
 		Section: "node_agent_k8s CLI",
 		Manual:  "Istio Node K8s Agent",
 	}))
-
-	// TODO: need integration with ctrlz?
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Errora(err)

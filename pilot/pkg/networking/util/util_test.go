@@ -17,17 +17,26 @@ package util
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
-	xdsutil "github.com/envoyproxy/go-control-plane/pkg/util"
+	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
+	listener "github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
+	http_conn "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
+	xdsutil "github.com/envoyproxy/go-control-plane/pkg/wellknown"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/any"
+	structpb "github.com/golang/protobuf/ptypes/struct"
+	"github.com/golang/protobuf/ptypes/wrappers"
 
-	"github.com/gogo/protobuf/types"
-	messagediff "gopkg.in/d4l3k/messagediff.v1"
+	proto2 "istio.io/istio/pkg/proto"
+
+	"github.com/golang/protobuf/proto"
+	"gopkg.in/d4l3k/messagediff.v1"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
+	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
 )
 
@@ -47,7 +56,7 @@ func TestConvertAddressToCidr(t *testing.T) {
 			"1.2.3.4",
 			&core.CidrRange{
 				AddressPrefix: "1.2.3.4",
-				PrefixLen: &types.UInt32Value{
+				PrefixLen: &wrappers.UInt32Value{
 					Value: 32,
 				},
 			},
@@ -57,8 +66,28 @@ func TestConvertAddressToCidr(t *testing.T) {
 			"1.2.3.4/16",
 			&core.CidrRange{
 				AddressPrefix: "1.2.3.4",
-				PrefixLen: &types.UInt32Value{
+				PrefixLen: &wrappers.UInt32Value{
 					Value: 16,
+				},
+			},
+		},
+		{
+			"ipv6",
+			"2001:db8::",
+			&core.CidrRange{
+				AddressPrefix: "2001:db8::",
+				PrefixLen: &wrappers.UInt32Value{
+					Value: 128,
+				},
+			},
+		},
+		{
+			"ipv6 with prefix",
+			"2001:db8::/64",
+			&core.CidrRange{
+				AddressPrefix: "2001:db8::",
+				PrefixLen: &wrappers.UInt32Value{
+					Value: 64,
 				},
 			},
 		},
@@ -100,76 +129,6 @@ func TestGetNetworkEndpointAddress(t *testing.T) {
 	}
 	if int(sock.GetPortValue()) != neIP.Port {
 		t.Fatalf("GetAddress() => want port %d, got port %d", neIP.Port, sock.GetPortValue())
-	}
-}
-
-func TestIsProxyVersionGE11(t *testing.T) {
-	tests := []struct {
-		name string
-		node *model.Proxy
-		want bool
-	}{
-		{
-			"the given Proxy version is 1.x",
-			&model.Proxy{
-				Metadata: map[string]string{
-					"ISTIO_PROXY_VERSION": "1.0",
-				},
-			},
-			false,
-		},
-		{
-			"the given Proxy version is not 1.x",
-			&model.Proxy{
-				Metadata: map[string]string{
-					"ISTIO_PROXY_VERSION": "0.8",
-				},
-			},
-			false,
-		},
-		{
-			"the given Proxy version is 1.1",
-			&model.Proxy{
-				Metadata: map[string]string{
-					"ISTIO_PROXY_VERSION": "1.1",
-				},
-			},
-			true,
-		},
-		{
-			"the given Proxy version is 1.1.1",
-			&model.Proxy{
-				Metadata: map[string]string{
-					"ISTIO_PROXY_VERSION": "1.1.1",
-				},
-			},
-			true,
-		},
-		{
-			"the given Proxy version is 2.0",
-			&model.Proxy{
-				Metadata: map[string]string{
-					"ISTIO_PROXY_VERSION": "2.0",
-				},
-			},
-			true,
-		},
-		{
-			"the given Proxy version is 10.0",
-			&model.Proxy{
-				Metadata: map[string]string{
-					"ISTIO_PROXY_VERSION": "2.0",
-				},
-			},
-			true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := IsProxyVersionGE11(tt.node); got != tt.want {
-				t.Errorf("IsProxyVersionGE11() = %v, want %v", got, tt.want)
-			}
-		})
 	}
 }
 
@@ -227,44 +186,46 @@ func TestConvertLocality(t *testing.T) {
 		name     string
 		locality string
 		want     *core.Locality
+		reverse  string
 	}{
 		{
-			"nil locality",
-			"",
-			nil,
+			name:     "nil locality",
+			locality: "",
+			want:     nil,
 		},
 		{
-			"locality with only region",
-			"region",
-			&core.Locality{
+			name:     "locality with only region",
+			locality: "region",
+			want: &core.Locality{
 				Region: "region",
 			},
 		},
 		{
-			"locality with region and zone",
-			"region/zone",
-			&core.Locality{
+			name:     "locality with region and zone",
+			locality: "region/zone",
+			want: &core.Locality{
 				Region: "region",
 				Zone:   "zone",
 			},
 		},
 		{
-			"locality with region zone and subzone",
-			"region/zone/subzone",
-			&core.Locality{
+			name:     "locality with region zone and subzone",
+			locality: "region/zone/subzone",
+			want: &core.Locality{
 				Region:  "region",
 				Zone:    "zone",
 				SubZone: "subzone",
 			},
 		},
 		{
-			"locality with region zone subzone and rack",
-			"region/zone/subzone/rack",
-			&core.Locality{
+			name:     "locality with region zone subzone and rack",
+			locality: "region/zone/subzone/rack",
+			want: &core.Locality{
 				Region:  "region",
 				Zone:    "zone",
 				SubZone: "subzone",
 			},
+			reverse: "region/zone/subzone",
 		},
 	}
 
@@ -273,6 +234,16 @@ func TestConvertLocality(t *testing.T) {
 			got := ConvertLocality(tt.locality)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Expected locality %#v, but got %#v", tt.want, got)
+			}
+			// Verify we can reverse the conversion back to the original input
+			reverse := LocalityToString(got)
+			if tt.reverse != "" {
+				// Special case, reverse lookup is different than original input
+				if tt.reverse != reverse {
+					t.Errorf("Expected locality string %s, got %v", tt.reverse, reverse)
+				}
+			} else if tt.locality != reverse {
+				t.Errorf("Expected locality string %s, got %v", tt.locality, reverse)
 			}
 		})
 	}
@@ -429,11 +400,11 @@ func TestBuildConfigInfoMetadata(t *testing.T) {
 				Type:      "destination-rule",
 			},
 			&core.Metadata{
-				FilterMetadata: map[string]*types.Struct{
+				FilterMetadata: map[string]*structpb.Struct{
 					IstioMetadataKey: {
-						Fields: map[string]*types.Value{
+						Fields: map[string]*structpb.Value{
 							"config": {
-								Kind: &types.Value_StringValue{
+								Kind: &structpb.Value_StringValue{
 									StringValue: "/apis/networking.istio.io/v1alpha3/namespaces/default/destination-rule/svcA",
 								},
 							},
@@ -477,15 +448,15 @@ func buildFakeCluster() *v2.Cluster {
 		Name: "outbound|8080||test.example.org",
 		LoadAssignment: &v2.ClusterLoadAssignment{
 			ClusterName: "outbound|8080||test.example.org",
-			Endpoints: []endpoint.LocalityLbEndpoints{
+			Endpoints: []*endpoint.LocalityLbEndpoints{
 				{
 					Locality: &core.Locality{
 						Region:  "region1",
 						Zone:    "zone1",
 						SubZone: "subzone1",
 					},
-					LbEndpoints: []endpoint.LbEndpoint{},
-					LoadBalancingWeight: &types.UInt32Value{
+					LbEndpoints: []*endpoint.LbEndpoint{},
+					LoadBalancingWeight: &wrappers.UInt32Value{
 						Value: 1,
 					},
 					Priority: 0,
@@ -496,8 +467,8 @@ func buildFakeCluster() *v2.Cluster {
 						Zone:    "zone1",
 						SubZone: "subzone2",
 					},
-					LbEndpoints: []endpoint.LbEndpoint{},
-					LoadBalancingWeight: &types.UInt32Value{
+					LbEndpoints: []*endpoint.LbEndpoint{},
+					LoadBalancingWeight: &wrappers.UInt32Value{
 						Value: 1,
 					},
 					Priority: 0,
@@ -508,16 +479,16 @@ func buildFakeCluster() *v2.Cluster {
 }
 
 func TestIsHTTPFilterChain(t *testing.T) {
-	httpFilterChain := listener.FilterChain{
-		Filters: []listener.Filter{
+	httpFilterChain := &listener.FilterChain{
+		Filters: []*listener.Filter{
 			{
 				Name: xdsutil.HTTPConnectionManager,
 			},
 		},
 	}
 
-	tcpFilterChain := listener.FilterChain{
-		Filters: []listener.Filter{
+	tcpFilterChain := &listener.FilterChain{
+		Filters: []*listener.Filter{
 			{
 				Name: xdsutil.TCPProxy,
 			},
@@ -530,5 +501,203 @@ func TestIsHTTPFilterChain(t *testing.T) {
 
 	if IsHTTPFilterChain(tcpFilterChain) {
 		t.Errorf("tcp filter chain detected as http filter chain")
+	}
+}
+
+var (
+	listener80 = &v2.Listener{Address: BuildAddress("0.0.0.0", 80)}
+	listener81 = &v2.Listener{Address: BuildAddress("0.0.0.0", 81)}
+	listenerip = &v2.Listener{Address: BuildAddress("1.1.1.1", 80)}
+)
+
+func BenchmarkGetByAddress(b *testing.B) {
+	for n := 0; n < b.N; n++ {
+		GetByAddress([]*v2.Listener{
+			listener80,
+			listener81,
+			listenerip,
+		}, *listenerip.Address)
+	}
+}
+
+func TestGetByAddress(t *testing.T) {
+	tests := []struct {
+		name      string
+		listeners []*v2.Listener
+		address   *core.Address
+		expected  *v2.Listener
+	}{
+		{
+			"no listeners",
+			[]*v2.Listener{},
+			BuildAddress("0.0.0.0", 80),
+			nil,
+		},
+		{
+			"single listener",
+			[]*v2.Listener{
+				listener80,
+			},
+			BuildAddress("0.0.0.0", 80),
+			listener80,
+		},
+		{
+			"multiple listeners",
+			[]*v2.Listener{
+				listener81,
+				listenerip,
+				listener80,
+			},
+			BuildAddress("0.0.0.0", 80),
+			listener80,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetByAddress(tt.listeners, *tt.address)
+			if got != tt.expected {
+				t.Errorf("Got %v, expected %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestMergeAnyWithStruct(t *testing.T) {
+	inHCM := &http_conn.HttpConnectionManager{
+		CodecType:  http_conn.HttpConnectionManager_HTTP1,
+		StatPrefix: "123",
+		HttpFilters: []*http_conn.HttpFilter{
+			{
+				Name: "filter1",
+				ConfigType: &http_conn.HttpFilter_TypedConfig{
+					TypedConfig: &any.Any{},
+				},
+			},
+		},
+		ServerName:        "scooby",
+		XffNumTrustedHops: 2,
+	}
+	inAny := MessageToAny(inHCM)
+
+	// listener.go sets this to 0
+	newTimeout := ptypes.DurationProto(5 * time.Minute)
+	userHCM := &http_conn.HttpConnectionManager{
+		AddUserAgent:      proto2.BoolTrue,
+		IdleTimeout:       newTimeout,
+		StreamIdleTimeout: newTimeout,
+		UseRemoteAddress:  proto2.BoolTrue,
+		XffNumTrustedHops: 5,
+		ServerName:        "foobar",
+		HttpFilters: []*http_conn.HttpFilter{
+			{
+				Name: "some filter",
+			},
+		},
+	}
+
+	expectedHCM := proto.Clone(inHCM).(*http_conn.HttpConnectionManager)
+	expectedHCM.AddUserAgent = userHCM.AddUserAgent
+	expectedHCM.IdleTimeout = userHCM.IdleTimeout
+	expectedHCM.StreamIdleTimeout = userHCM.StreamIdleTimeout
+	expectedHCM.UseRemoteAddress = userHCM.UseRemoteAddress
+	expectedHCM.XffNumTrustedHops = userHCM.XffNumTrustedHops
+	expectedHCM.HttpFilters = append(expectedHCM.HttpFilters, userHCM.HttpFilters...)
+	expectedHCM.ServerName = userHCM.ServerName
+
+	pbStruct := MessageToStruct(userHCM)
+
+	outAny, err := MergeAnyWithStruct(inAny, pbStruct)
+	if err != nil {
+		t.Errorf("Failed to merge: %v", err)
+	}
+
+	outHCM := http_conn.HttpConnectionManager{}
+	if err = ptypes.UnmarshalAny(outAny, &outHCM); err != nil {
+		t.Errorf("Failed to unmarshall outAny to outHCM: %v", err)
+	}
+
+	if !reflect.DeepEqual(expectedHCM, &outHCM) {
+		t.Errorf("Merged HCM does not match the expected output")
+	}
+}
+
+func TestHandleCrash(t *testing.T) {
+	defer func() {
+		if x := recover(); x != nil {
+			t.Errorf("Expected no panic ")
+		}
+	}()
+
+	defer HandleCrash()
+	panic("test")
+}
+
+func TestCustomHandleCrash(t *testing.T) {
+	ch := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case <-ch:
+			t.Logf("crash handler called")
+		case <-time.After(1 * time.Second):
+			t.Errorf("Custom handler not called")
+		}
+	}()
+
+	defer HandleCrash(func() {
+		ch <- struct{}{}
+	})
+
+	panic("test")
+}
+
+func TestIsAllowAnyOutbound(t *testing.T) {
+	tests := []struct {
+		name   string
+		node   *model.Proxy
+		result bool
+	}{
+		{
+			name:   "NilSidecarScope",
+			node:   &model.Proxy{},
+			result: false,
+		},
+		{
+			name: "NilOutboundTrafficPolicy",
+			node: &model.Proxy{
+				SidecarScope: &model.SidecarScope{},
+			},
+			result: false,
+		},
+		{
+			name: "OutboundTrafficPolicyRegistryOnly",
+			node: &model.Proxy{
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_REGISTRY_ONLY,
+					},
+				},
+			},
+			result: false,
+		},
+		{
+			name: "OutboundTrafficPolicyAllowAny",
+			node: &model.Proxy{
+				SidecarScope: &model.SidecarScope{
+					OutboundTrafficPolicy: &networking.OutboundTrafficPolicy{
+						Mode: networking.OutboundTrafficPolicy_ALLOW_ANY,
+					},
+				},
+			},
+			result: true,
+		},
+	}
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			out := IsAllowAnyOutbound(tests[i].node)
+			if out != tests[i].result {
+				t.Errorf("Expected %t but got %t for test case: %v\n", tests[i].result, out, tests[i].node)
+			}
+		})
 	}
 }

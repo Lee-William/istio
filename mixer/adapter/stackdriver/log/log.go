@@ -24,6 +24,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode/utf8"
 
 	"cloud.google.com/go/logging"
 	"cloud.google.com/go/logging/logadmin"
@@ -35,8 +36,8 @@ import (
 	"istio.io/istio/mixer/adapter/stackdriver/config"
 	"istio.io/istio/mixer/adapter/stackdriver/helper"
 	"istio.io/istio/mixer/pkg/adapter"
-	"istio.io/istio/mixer/pkg/pool"
 	"istio.io/istio/mixer/template/logentry"
+	"istio.io/pkg/pool"
 )
 
 type (
@@ -96,13 +97,13 @@ func (b *builder) Validate() *adapter.ConfigErrors {
 
 func (b *builder) Build(ctx context.Context, env adapter.Env) (adapter.Handler, error) {
 	logger := env.Logger()
-	md := b.mg.GenerateMetadata()
 	cfg := b.cfg
+	md := b.mg.GenerateMetadata()
 	if cfg.ProjectId == "" {
 		// Try to fill project id with Metadata if it is not provided.
 		cfg.ProjectId = md.ProjectID
 	}
-	client, err := b.makeClient(context.Background(), cfg.ProjectId, helper.ToOpts(cfg)...)
+	client, err := b.makeClient(context.Background(), cfg.ProjectId, helper.ToOpts(cfg, env.Logger())...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create stackdriver logging client: %v", err)
 	}
@@ -110,7 +111,7 @@ func (b *builder) Build(ctx context.Context, env adapter.Env) (adapter.Handler, 
 		_ = logger.Errorf("Stackdriver logger failed with: %v", err)
 	}
 
-	syncClient, err := b.makeSyncClient(context.Background(), cfg.ProjectId, helper.ToOpts(cfg)...)
+	syncClient, err := b.makeSyncClient(context.Background(), cfg.ProjectId, helper.ToOpts(cfg, env.Logger())...)
 	if err != nil {
 		_ = logger.Errorf("failed to create stackdriver sink logging client: %v", err)
 		syncClient = nil
@@ -226,18 +227,33 @@ func toLabelMap(names []string, variables map[string]interface{}, logEntryTypes 
 		v := variables[name]
 		switch vt := v.(type) {
 		case string:
-			out[name] = vt
+			out[name] = stripBadUTF8(vt)
 		case []byte:
 			if logEntryTypes[name] == istio_policy_v1beta1.IP_ADDRESS {
 				out[name] = net.IP(vt).String()
 			} else {
-				out[name] = fmt.Sprintf("%v", vt)
+				out[name] = stripBadUTF8(fmt.Sprintf("%v", vt))
 			}
 		default:
-			out[name] = fmt.Sprintf("%v", vt)
+			out[name] = stripBadUTF8(fmt.Sprintf("%v", vt))
 		}
 	}
 	return out
+}
+
+func stripBadUTF8(input string) string {
+	if utf8.ValidString(input) {
+		return input
+	}
+
+	out := make([]rune, 0, len(input))
+	for _, r := range input {
+		if r == utf8.RuneError {
+			continue
+		}
+		out = append(out, r)
+	}
+	return string(out)
 }
 
 func toReq(mapping *config.Params_LogInfo_HttpRequestMapping, variables map[string]interface{}) *logging.HTTPRequest {

@@ -25,10 +25,11 @@ import (
 	"github.com/gogo/protobuf/types"
 
 	mcp "istio.io/api/mcp/v1alpha1"
+
+	"istio.io/istio/galley/pkg/config/monitoring"
 	"istio.io/istio/galley/pkg/metadata"
 	"istio.io/istio/galley/pkg/runtime/conversions"
 	"istio.io/istio/galley/pkg/runtime/log"
-	"istio.io/istio/galley/pkg/runtime/monitoring"
 	"istio.io/istio/galley/pkg/runtime/processing"
 	"istio.io/istio/galley/pkg/runtime/resource"
 	"istio.io/istio/pkg/mcp/snapshot"
@@ -38,7 +39,6 @@ var _ processing.Handler = &State{}
 
 // State is the in-memory state of Galley.
 type State struct {
-	schema   *resource.Schema
 	listener processing.Listener
 
 	config *Config
@@ -71,10 +71,9 @@ type resourceTypeState struct {
 	versions map[resource.FullName]resource.Version
 }
 
-func newState(schema *resource.Schema, cfg *Config, listener processing.Listener) *State {
+func newState(cfg *Config, listener processing.Listener) *State {
 	now := time.Now()
 	s := &State{
-		schema:           schema,
 		listener:         listener,
 		config:           cfg,
 		entries:          make(map[resource.Collection]*resourceTypeState),
@@ -83,7 +82,7 @@ func newState(schema *resource.Schema, cfg *Config, listener processing.Listener
 
 	// pre-populate state for all known types so that built snapshots
 	// includes valid default version for empty resource collections.
-	for _, info := range schema.All() {
+	for _, info := range cfg.Schema.All() {
 		s.entries[info.Collection] = &resourceTypeState{
 			entries:  make(map[resource.FullName]*mcp.Resource),
 			versions: make(map[resource.FullName]resource.Version),
@@ -119,11 +118,13 @@ func (s *State) Handle(event resource.Event) {
 		pks.entries[event.Entry.ID.FullName] = entry
 		pks.versions[event.Entry.ID.FullName] = event.Entry.ID.Version
 		monitoring.RecordStateTypeCount(event.Entry.ID.Collection.String(), len(pks.entries))
+		monitorEntry(event.Entry.ID, true)
 
 	case resource.Deleted:
 		delete(pks.entries, event.Entry.ID.FullName)
 		delete(pks.versions, event.Entry.ID.FullName)
 		monitoring.RecordStateTypeCount(event.Entry.ID.Collection.String(), len(pks.entries))
+		monitorEntry(event.Entry.ID, false)
 
 	default:
 		log.Scope.Errorf("Unknown event kind: %v", event.Kind)
@@ -318,4 +319,13 @@ func (s *State) String() string {
 	_, _ = fmt.Fprintf(&b, "%v", sn)
 
 	return b.String()
+}
+
+func monitorEntry(resourceKey resource.VersionedKey, added bool) {
+	namespace, name := resourceKey.FullName.InterpretAsNamespaceAndName()
+	value := 1
+	if !added {
+		value = 0
+	}
+	monitoring.RecordDetailedStateType(namespace, name, resourceKey.Collection, value)
 }

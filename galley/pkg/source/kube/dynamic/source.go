@@ -116,14 +116,12 @@ func (s *source) Start(handler resource.EventHandler) error {
 			DeleteFunc: func(obj interface{}) { s.handleEvent(resource.Deleted, obj) },
 		})
 
-		// Send the an event after the cache syncs.
-		go func() {
-			_ = cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced)
-			handler(resource.FullSyncEvent)
-		}()
-
 		// Start CRD shared informer and wait for it to exit.
-		s.informer.Run(ctx.Done())
+		go s.informer.Run(ctx.Done())
+		// Send the an event after the cache syncs.
+		if cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced) {
+			go handler(resource.FullSyncEvent)
+		}
 	})
 }
 
@@ -150,7 +148,7 @@ func (s *source) handleEvent(c resource.EventKind, obj interface{}) {
 		// using aprior knowledge of the GVK for this source.
 		u.SetGroupVersionKind(schema.GroupVersionKind{
 			Group:   s.spec.Group,
-			Version: s.spec.Version,
+			Version: s.spec.GetAPIVersion(),
 			Kind:    s.spec.Kind,
 		})
 	}
@@ -168,10 +166,10 @@ func ConvertAndLog(cfg *converter.Config, spec sourceSchema.ResourceSpec, key re
 	entries, err := spec.Converter(cfg, spec.Target, key, spec.Kind, u)
 	if err != nil {
 		log.Scope.Errorf("Unable to convert unstructured to proto: %s/%s: %v", key, resourceVersion, err)
-		stats.RecordConverterResult(false, spec.Version, spec.Group, spec.Kind)
+		stats.RecordConverterResult(false, spec.GetAPIVersion(), spec.Group, spec.Kind)
 		return nil, err
 	}
-	stats.RecordConverterResult(true, spec.Version, spec.Group, spec.Kind)
+	stats.RecordConverterResult(true, spec.GetAPIVersion(), spec.Group, spec.Kind)
 	return entries, nil
 }
 

@@ -27,6 +27,7 @@ package simple
 import (
 	"bytes"
 	"flag"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -37,9 +38,9 @@ import (
 	"fortio.org/fortio/fhttp"
 	"fortio.org/fortio/periodic"
 
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/tests/e2e/framework"
 	"istio.io/istio/tests/util"
+	"istio.io/pkg/log"
 )
 
 const (
@@ -68,12 +69,9 @@ var (
 	versionSubdir = v1alpha3Subdir
 )
 
-func init() {
+func TestMain(m *testing.M) {
 	testFlags.Init()
 	flag.Parse()
-}
-
-func TestMain(m *testing.M) {
 	if err := framework.InitLogging(); err != nil {
 		panic("cannot setup logging")
 	}
@@ -226,7 +224,13 @@ func TestAuthWithHeaders(t *testing.T) {
 	}
 	podIstioIP := podList[0]
 	log.Infof("From client, non istio injected pod \"%s\" to istio pod \"%s\"", podNoIstio, podIstioIP)
-	// TODO: ipv6 fix
+	addr := net.ParseIP(podIstioIP)
+	if addr == nil {
+		t.Fatalf("the IP of app=echosrv,extrap=non pod is invalid: %s", podIstioIP)
+	}
+	if addr.To4() == nil {
+		podIstioIP = "[" + podIstioIP + "]"
+	}
 	res, err := util.Shell("kubectl exec -n %s %s -- fortio curl -H Host:echosrv-extrap.%s:8088 http://%s:8088/debug",
 		ns, podNoIstio, ns, podIstioIP)
 	if tc.Kube.AuthEnabled {

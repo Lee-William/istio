@@ -22,16 +22,15 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/gogo/protobuf/types"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"istio.io/pkg/log"
 
 	"istio.io/istio/pilot/pkg/bootstrap"
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/proxy/envoy"
 	"istio.io/istio/pilot/pkg/serviceregistry"
+	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/keepalive"
-	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/test/env"
+
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 var (
@@ -56,7 +55,7 @@ type TearDownFunc func()
 func EnsureTestServer(args ...func(*bootstrap.PilotArgs)) (*bootstrap.Server, TearDownFunc) {
 	server, tearDown, err := setup(args...)
 	if err != nil {
-		log.Errora("Failed to start in-process server", err)
+		log.Errora("Failed to start in-process server: ", err)
 		panic(err)
 	}
 	return server, tearDown
@@ -77,24 +76,22 @@ func setup(additionalArgs ...func(*bootstrap.PilotArgs)) (*bootstrap.Server, Tea
 	}
 	httpAddr := ":" + pilotHTTP
 
-	meshConfig := model.DefaultMeshConfig()
+	meshConfig := mesh.DefaultMeshConfig()
 	// Create a test pilot discovery service configured to watch the tempDir.
 	args := bootstrap.PilotArgs{
 		Namespace: "testing",
-		DiscoveryOptions: envoy.DiscoveryServiceOptions{
+		DiscoveryOptions: bootstrap.DiscoveryServiceOptions{
 			HTTPAddr:        httpAddr,
 			GrpcAddr:        ":0",
 			SecureGrpcAddr:  ":0",
-			EnableCaching:   true,
 			EnableProfiling: true,
 		},
 		//TODO: start mixer first, get its address
 		Mesh: bootstrap.MeshArgs{
-			MixerAddress:    "istio-mixer.istio-system:9091",
-			RdsRefreshDelay: types.DurationProto(10 * time.Millisecond),
+			MixerAddress: "istio-mixer.istio-system:9091",
 		},
 		Config: bootstrap.ConfigArgs{
-			KubeConfig: env.IstioSrc + "/.circleci/config",
+			KubeConfig: env.IstioSrc + "/tests/util/kubeconfig",
 		},
 		Service: bootstrap.ServiceArgs{
 			// Using the Mock service registry, which provides the hello and world services.
@@ -102,7 +99,7 @@ func setup(additionalArgs ...func(*bootstrap.PilotArgs)) (*bootstrap.Server, Tea
 				string(serviceregistry.MockRegistry)},
 		},
 		MeshConfig:        &meshConfig,
-		MCPMaxMessageSize: bootstrap.DefaultMCPMaxMsgSize,
+		MCPMaxMessageSize: 1024 * 1024 * 4,
 		KeepaliveOptions:  keepalive.DefaultOption(),
 		ForceStop:         true,
 		// TODO: add the plugins, so local tests are closer to reality and test full generation
@@ -157,8 +154,8 @@ func setup(additionalArgs ...func(*bootstrap.PilotArgs)) (*bootstrap.Server, Tea
 		if err != nil {
 			return false, nil
 		}
-		defer resp.Body.Close()
-		ioutil.ReadAll(resp.Body)
+		defer func() { _ = resp.Body.Close() }()
+		_, _ = ioutil.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusOK {
 			return true, nil
 		}

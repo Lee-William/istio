@@ -26,19 +26,29 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"istio.io/istio/pilot/pkg/bootstrap"
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pkg/cmd"
-	"istio.io/istio/pkg/collateral"
-	"istio.io/istio/pkg/ctrlz"
 	"istio.io/istio/pkg/keepalive"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/version"
+	"istio.io/pkg/collateral"
+	"istio.io/pkg/ctrlz"
+	"istio.io/pkg/log"
+	"istio.io/pkg/version"
 )
 
 var (
 	serverArgs = bootstrap.PilotArgs{
 		CtrlZOptions:     ctrlz.DefaultOptions(),
 		KeepaliveOptions: keepalive.DefaultOption(),
+		// TODO replace with mesh config?
+		InjectionOptions: bootstrap.InjectionOptions{
+			InjectionDirectory: "/etc/istio/inject",
+			Port:               15017,
+		},
+
+		MCPMaxMessageSize:        1024 * 1024 * 4, // default grpc maximum message size
+		MCPInitialConnWindowSize: 1024 * 1024,     // default grpc InitialWindowSize
+		MCPInitialWindowSize:     1024 * 1024,     // default grpc ConnWindowSize
 	}
 
 	loggingOptions = log.DefaultOptions()
@@ -55,6 +65,8 @@ var (
 		Short: "Start Istio proxy discovery service.",
 		Args:  cobra.ExactArgs(0),
 		RunE: func(c *cobra.Command, args []string) error {
+			serverArgs.Config.DistributionTrackingEnabled = features.EnableDistributionTracking
+			serverArgs.Config.DistributionCacheRetention = features.DistributionHistoryRetention
 			cmd.PrintFlags(c.Flags())
 			if err := log.Configure(loggingOptions); err != nil {
 				return err
@@ -111,8 +123,12 @@ func init() {
 		"comma separated list of networking plugins to enable")
 
 	// MCP client flags
-	discoveryCmd.PersistentFlags().IntVar(&serverArgs.MCPMaxMessageSize, "mcpMaxMsgSize", bootstrap.DefaultMCPMaxMsgSize,
+	discoveryCmd.PersistentFlags().IntVar(&serverArgs.MCPMaxMessageSize, "mcpMaxMsgSize", serverArgs.MCPMaxMessageSize,
 		"Max message size received by MCP's grpc client")
+	discoveryCmd.PersistentFlags().IntVar(&serverArgs.MCPInitialWindowSize, "mcpInitialWindowSize", serverArgs.MCPInitialWindowSize,
+		"Initial window size for MCP's gRPC connection")
+	discoveryCmd.PersistentFlags().IntVar(&serverArgs.MCPInitialConnWindowSize, "mcpInitialConnWindowSize", serverArgs.MCPInitialConnWindowSize,
+		"Initial connection window size for MCP's gRPC connection")
 
 	// Config Controller options
 	discoveryCmd.PersistentFlags().BoolVar(&serverArgs.Config.DisableInstallCRDs, "disable-install-crds", false,
@@ -131,8 +147,6 @@ func init() {
 		"The domain serves to identify the system with spiffe")
 	discoveryCmd.PersistentFlags().StringVar(&serverArgs.Service.Consul.ServerURL, "consulserverURL", "",
 		"URL for the Consul server")
-	discoveryCmd.PersistentFlags().DurationVar(&serverArgs.Service.Consul.Interval, "consulserverInterval", 2*time.Second,
-		"Interval (in seconds) for polling the Consul service registry")
 
 	// using address, so it can be configured as localhost:.. (possibly UDS in future)
 	discoveryCmd.PersistentFlags().StringVar(&serverArgs.DiscoveryOptions.HTTPAddr, "httpAddr", ":8080",
@@ -145,8 +159,6 @@ func init() {
 		"HTTP address to use for pilot's self-monitoring information")
 	discoveryCmd.PersistentFlags().BoolVar(&serverArgs.DiscoveryOptions.EnableProfiling, "profile", true,
 		"Enable profiling via web interface host:port/debug/pprof")
-	discoveryCmd.PersistentFlags().BoolVar(&serverArgs.DiscoveryOptions.EnableCaching, "discoveryCache", true,
-		"Enable caching discovery service responses")
 
 	// Attach the Istio logging options to the command.
 	loggingOptions.AttachCobraFlags(rootCmd)
@@ -166,6 +178,7 @@ func init() {
 		Section: "pilot-discovery CLI",
 		Manual:  "Istio Pilot Discovery",
 	}))
+
 }
 
 func main() {

@@ -19,19 +19,18 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
 
 	"go.opencensus.io/tag"
 
 	mcp "istio.io/api/mcp/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
+
+	"istio.io/istio/galley/pkg/config/monitoring"
 	"istio.io/istio/galley/pkg/metadata"
 	"istio.io/istio/galley/pkg/runtime/log"
-	"istio.io/istio/galley/pkg/runtime/monitoring"
 	"istio.io/istio/galley/pkg/runtime/processing"
-	"istio.io/istio/galley/pkg/runtime/projections/serviceentry/convert"
-	"istio.io/istio/galley/pkg/runtime/projections/serviceentry/node"
+	"istio.io/istio/galley/pkg/runtime/projections/serviceentry/converter"
 	"istio.io/istio/galley/pkg/runtime/projections/serviceentry/pod"
 	"istio.io/istio/galley/pkg/runtime/resource"
 	"istio.io/istio/pkg/mcp/snapshot"
@@ -60,16 +59,16 @@ var _ processing.Handler = &Handler{}
 
 // Handler is a processing.Handler that generates snapshots containing synthetic ServiceEntry projections.
 type Handler struct {
-	domainSuffix string
+	converter *converter.Instance
 
 	listener processing.Listener
 
-	services     map[resource.FullName]resource.Entry
-	endpoints    map[resource.FullName]resource.Entry
-	podsHandler  processing.Handler
-	nodesHandler processing.Handler
-	pods         pod.Cache
-	nodes        node.Cache
+	services  map[resource.FullName]resource.Entry
+	endpoints map[resource.FullName]resource.Entry
+	ipToName  map[string]map[resource.FullName]struct{}
+
+	podHandler  processing.Handler
+	nodeHandler processing.Handler
 
 	// The version number for the current State of the object. Every time mcpResources or versions change,
 	// the version number also change
@@ -86,9 +85,25 @@ type Handler struct {
 }
 
 // NewHandler creates a new Handler instance.
-func NewHandler(domainSuffix string, listener processing.Listener) *Handler {
-	pods, podsHandler := pod.NewCache()
-	nodes, nodesHandler := node.NewCache()
+func NewHandler(domain string, listener processing.Listener) *Handler {
+	handler := &Handler{
+		listener:     listener,
+		services:     make(map[resource.FullName]resource.Entry),
+		endpoints:    make(map[resource.FullName]resource.Entry),
+		ipToName:     make(map[string]map[resource.FullName]struct{}),
+		mcpResources: make(map[resource.FullName]*mcp.Resource),
+	}
+
+	podCache, cacheHandler := pod.NewCache(pod.Listener{
+		PodAdded:   handler.podUpdated,
+		PodUpdated: handler.podUpdated,
+		PodDeleted: handler.podUpdated,
+	})
+
+	handler.podHandler = cacheHandler
+	handler.nodeHandler = cacheHandler
+
+	handler.converter = converter.New(domain, podCache)
 
 	statsCtx, err := tag.New(context.Background(), tag.Insert(monitoring.CollectionTag,
 		metadata.IstioNetworkingV1alpha3SyntheticServiceentries.Collection.String()))
@@ -96,216 +111,234 @@ func NewHandler(domainSuffix string, listener processing.Listener) *Handler {
 		log.Scope.Errorf("Error creating monitoring context for counting state: %v", err)
 		statsCtx = nil
 	}
+	handler.statsCtx = statsCtx
 
-	return &Handler{
-		domainSuffix: domainSuffix,
-		listener:     listener,
-		services:     make(map[resource.FullName]resource.Entry),
-		endpoints:    make(map[resource.FullName]resource.Entry),
-		mcpResources: make(map[resource.FullName]*mcp.Resource),
-		podsHandler:  podsHandler,
-		nodesHandler: nodesHandler,
-		pods:         pods,
-		nodes:        nodes,
-		statsCtx:     statsCtx,
-	}
+	return handler
 }
 
 // Handle incoming events and generate synthetic ServiceEntry projections.
-func (p *Handler) Handle(event resource.Event) {
+func (h *Handler) Handle(event resource.Event) {
 	switch event.Entry.ID.Collection {
 	case metadata.K8sCoreV1Endpoints.Collection:
 		// Update the projections
-		p.handleEndpointsEvent(event)
+		h.handleEndpointsEvent(event)
 	case metadata.K8sCoreV1Services.Collection:
 		// Update the projections
-		p.handleServiceEvent(event)
+		h.handleServiceEvent(event)
 	case metadata.K8sCoreV1Nodes.Collection:
-		// Just add the node to the cache.
-		p.nodesHandler.Handle(event)
+		// Update the pod cache.
+		h.nodeHandler.Handle(event)
 	case metadata.K8sCoreV1Pods.Collection:
-		// Just add the pod to the cache.
-		p.podsHandler.Handle(event)
+		// Update the pod cache.
+		h.podHandler.Handle(event)
 	default:
 		scope.Warnf("received event with unexpected collection: %v", event.Entry.ID.Collection)
 	}
 }
 
+func (h *Handler) podUpdated(p pod.Info) {
+	// Update the endpoints associated with this IP.
+	for name := range h.ipToName[p.IP] {
+		h.doUpdate(name)
+	}
+}
+
 // Builds the snapshot of the current resources.
-func (p *Handler) BuildSnapshot() snapshot.Snapshot {
+func (h *Handler) BuildSnapshot() snapshot.Snapshot {
 	now := time.Now()
-	monitoring.RecordProcessorSnapshotPublished(p.pendingEvents, now.Sub(p.lastSnapshotTime))
-	p.lastSnapshotTime = now
-	p.pendingEvents = 0
+	monitoring.RecordProcessorSnapshotPublished(h.pendingEvents, now.Sub(h.lastSnapshotTime))
+	h.lastSnapshotTime = now
+	h.pendingEvents = 0
 
 	b := snapshot.NewInMemoryBuilder()
 
 	// Copy the entries.
-	entries := make([]*mcp.Resource, 0, len(p.mcpResources))
-	for _, r := range p.mcpResources {
+	entries := make([]*mcp.Resource, 0, len(h.mcpResources))
+	for _, r := range h.mcpResources {
 		entries = append(entries, r)
 	}
 
 	// Create the collection resources on the Snapshot.
-	version := strconv.FormatInt(p.version, 10)
+	version := strconv.FormatInt(h.version, 10)
 	b.Set(collection.String(), version, entries)
 
 	return b.Build()
 }
 
-func (p *Handler) handleServiceEvent(event resource.Event) {
+func (h *Handler) handleServiceEvent(event resource.Event) {
 	service := event.Entry
-	fullName := service.ID.FullName
+	name := service.ID.FullName
 
 	switch event.Kind {
 	case resource.Added, resource.Updated:
 		// Store the service.
-		p.services[fullName] = service
+		h.services[name] = service
 
-		// Get the associated endpoints, if available.
-		var endpoints *resource.Entry
-		if epEntry, ok := p.endpoints[fullName]; ok {
-			endpoints = &epEntry
-		}
-
-		// Convert to an MCP resource to be used in the snapshot.
-		se := p.newServiceEntry(service, endpoints)
-		mcpEntry, ok := p.toMcpResource(fullName, service, endpoints, &se)
-		if !ok {
-			return
-		}
-		p.setMcpEntry(fullName, mcpEntry)
-
-		p.updateVersion()
-
+		h.doUpdate(name)
 	case resource.Deleted:
 		// Delete the Service and ServiceEntry
-		delete(p.services, fullName)
-		p.deleteMcpResource(fullName)
-		p.updateVersion()
+		delete(h.services, name)
+		h.deleteMcpResource(name)
+		h.updateVersion()
 	default:
 		scope.Errorf("unknown event kind: %v", event.Kind)
 	}
 }
 
-func (p *Handler) handleEndpointsEvent(event resource.Event) {
+func (h *Handler) handleEndpointsEvent(event resource.Event) {
 	endpoints := event.Entry
-	fullName := endpoints.ID.FullName
+	name := endpoints.ID.FullName
 
 	switch event.Kind {
 	case resource.Added, resource.Updated:
+		// Update the IPs for this endpoint.
+		h.updateEndpointIPs(name, endpoints)
+
 		// Store the endpoints.
-		p.endpoints[fullName] = endpoints
+		h.endpoints[name] = endpoints
 
-		// Look up the service associated with the endpoints.
-		service, ok := p.services[fullName]
-		if !ok {
-			// Wait until we get a Service before we create the ServiceEntry.
-			scope.Debugf("received endpoints before service for: %s", fullName)
-			return
-		}
-
-		// Convert to an MCP resource to be used in the snapshot.
-		se := p.newServiceEntry(service, &endpoints)
-		mcpEntry, ok := p.toMcpResource(fullName, service, &endpoints, &se)
-		if !ok {
-			return
-		}
-		p.setMcpEntry(fullName, mcpEntry)
-
-		p.updateVersion()
-
+		h.doUpdate(name)
 	case resource.Deleted:
+		// Remove the IPs for this endpoint.
+		h.deleteEndpointIPs(name, endpoints)
+
 		// The lifecycle of the ServiceEntry is bound to the service, so only delete the endpoints entry here.
-		delete(p.endpoints, fullName)
+		delete(h.endpoints, name)
 
-		// Look up the service associated with the endpoints.
-		service, ok := p.services[fullName]
-		if !ok {
-			return
-		}
-
-		// Update the MCP entry to clear out the endpoints.
-		se := p.newServiceEntry(service, nil)
-		mcpEntry, ok := p.toMcpResource(fullName, service, nil, &se)
-		if !ok {
-			return
-		}
-		p.setMcpEntry(fullName, mcpEntry)
-
-		p.updateVersion()
+		h.doUpdate(name)
 	default:
 		scope.Errorf("unknown event kind: %v", event.Kind)
 	}
 }
 
-func (p *Handler) setMcpEntry(fullName resource.FullName, mcpEntry *mcp.Resource) {
-	p.mcpResources[fullName] = mcpEntry
+func (h *Handler) setMcpEntry(name resource.FullName, mcpEntry *mcp.Resource) {
+	h.mcpResources[name] = mcpEntry
 }
 
-func (p *Handler) deleteMcpResource(fullName resource.FullName) {
-	delete(p.mcpResources, fullName)
+func (h *Handler) deleteMcpResource(name resource.FullName) {
+	delete(h.mcpResources, name)
 }
 
-func (p *Handler) updateVersion() {
-	p.version++
-	monitoring.RecordStateTypeCountWithContext(p.statsCtx, len(p.mcpResources))
+func (h *Handler) updateVersion() {
+	h.version++
+	monitoring.RecordStateTypeCountWithContext(h.statsCtx, len(h.mcpResources))
 
 	if scope.DebugEnabled() {
-		scope.Debugf("in-memory state has changed:\n%v\n", p)
+		scope.Debugf("in-memory state has changed:\n%v\n", h)
 	}
-	p.pendingEvents++
-	p.notifyChanged()
+	h.pendingEvents++
+	h.notifyChanged()
 }
 
-func (p *Handler) notifyChanged() {
-	p.listener.CollectionChanged(collection)
+func (h *Handler) notifyChanged() {
+	h.listener.CollectionChanged(collection)
 }
 
-func (p *Handler) versionString() string {
-	return strconv.FormatInt(p.version, 10)
+func (h *Handler) versionString() string {
+	return strconv.FormatInt(h.version, 10)
 }
 
-func (p *Handler) newServiceEntry(service resource.Entry, endpoints *resource.Entry) networking.ServiceEntry {
+func (h *Handler) doUpdate(name resource.FullName) {
+	// Look up the service associated with the endpoints.
+	service, ok := h.services[name]
+	if !ok {
+		// No service, nothing to update.
+		return
+	}
+
+	// Get the associated endpoints, if available.
+	var endpoints *resource.Entry
+	if epEntry, ok := h.endpoints[name]; ok {
+		endpoints = &epEntry
+	}
+
+	// Convert to an MCP resource to be used in the snapshot.
+	mcpEntry, ok := h.toMcpResource(&service, endpoints)
+	if !ok {
+		return
+	}
+	h.setMcpEntry(name, mcpEntry)
+
+	h.updateVersion()
+}
+
+func (h *Handler) toMcpResource(service *resource.Entry, endpoints *resource.Entry) (*mcp.Resource, bool) {
+	meta := mcp.Metadata{}
 	se := networking.ServiceEntry{}
-
-	serviceSpec := service.Item.(*coreV1.ServiceSpec)
-
-	// Apply part of the conversion from the k8s Service.
-	convert.Service(serviceSpec, service.Metadata, service.ID.FullName, p.domainSuffix, &se)
-
-	// Apply part of the conversion from the k8s Endpoints, if available.
-	if endpoints != nil {
-		convert.Endpoints(endpoints.Item.(*coreV1.Endpoints), p.pods, p.nodes, &se)
-	}
-	return se
-}
-
-func (p *Handler) toMcpResource(fullName resource.FullName, service resource.Entry, endpoints *resource.Entry,
-	serviceEntry proto.Message) (*mcp.Resource, bool) {
-
-	body, err := types.MarshalAny(serviceEntry)
-	if err != nil {
-		scope.Errorf("error serializing proto from source e: %v:", serviceEntry)
+	if err := h.converter.Convert(service, endpoints, &meta, &se); err != nil {
+		scope.Errorf("error converting to ServiceEntry: %v", err)
 		return nil, false
 	}
 
-	createTime, err := types.TimestampProto(service.Metadata.CreateTime)
+	// Set the version on the metadata.
+	meta.Version = h.versionString()
+
+	body, err := types.MarshalAny(&se)
 	if err != nil {
-		scope.Errorf("error parsing resource create_time for event metadata (%v): %v", service.Metadata, err)
+		scope.Errorf("error serializing proto from source e: %v", se)
 		return nil, false
 	}
 
 	entry := &mcp.Resource{
-		Metadata: &mcp.Metadata{
-			Name:        fullName.String(),
-			CreateTime:  createTime,
-			Version:     p.versionString(),
-			Labels:      service.Metadata.Labels,
-			Annotations: convert.Annotations(service, endpoints),
-		},
-		Body: body,
+		Metadata: &meta,
+		Body:     body,
 	}
 
 	return entry, true
+}
+
+func (h *Handler) updateEndpointIPs(name resource.FullName, newRE resource.Entry) {
+	newIPs := getEndpointIPs(newRE)
+	var prevIPs map[string]struct{}
+
+	if prev, exists := h.endpoints[name]; exists {
+		prevIPs = getEndpointIPs(prev)
+
+		// Delete any IPs missing from the new endpoints.
+		for prevIP := range prevIPs {
+			if _, exists := newIPs[prevIP]; !exists {
+				h.deleteEndpointIP(name, prevIP)
+			}
+		}
+	}
+
+	// Add/update
+	for newIP := range newIPs {
+		names := h.ipToName[newIP]
+		if names == nil {
+			names = make(map[resource.FullName]struct{})
+			h.ipToName[newIP] = names
+		}
+		names[name] = struct{}{}
+	}
+}
+
+func (h *Handler) deleteEndpointIPs(name resource.FullName, endpoints resource.Entry) {
+	ips := getEndpointIPs(endpoints)
+	for ip := range ips {
+		h.deleteEndpointIP(name, ip)
+	}
+}
+
+func (h *Handler) deleteEndpointIP(name resource.FullName, ip string) {
+	names := h.ipToName[ip]
+	if names != nil {
+		// Remove the name from the names map for this IP.
+		delete(names, name)
+		if len(names) == 0 {
+			// There are no more endpoints using this IP. Delete the map.
+			delete(h.ipToName, ip)
+		}
+	}
+}
+
+func getEndpointIPs(entry resource.Entry) map[string]struct{} {
+	ips := make(map[string]struct{})
+	endpoints := entry.Item.(*coreV1.Endpoints)
+	for _, subset := range endpoints.Subsets {
+		for _, address := range subset.Addresses {
+			ips[address.IP] = struct{}{}
+		}
+	}
+	return ips
 }

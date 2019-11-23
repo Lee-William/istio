@@ -1,5 +1,19 @@
 #!/bin/bash
 
+# Copyright Istio Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 vm_driver="kvm2"
 
 case "${OSTYPE}" in
@@ -31,8 +45,8 @@ if [[ "${VM_DRIVER}" == "none" ]]; then
 fi
 
 $SUDO_PREFIX minikube start \
-    --extra-config=apiserver.admission-control="NamespaceLifecycle,LimitRanger,ServiceAccount,PersistentVolumeLabel,DefaultStorageClass,DefaultTolerationSeconds,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,ResourceQuota" \
-    --kubernetes-version=v1.10.0 \
+    --extra-config=apiserver.enable-admission-plugins="NamespaceLifecycle,LimitRanger,ServiceAccount,PersistentVolumeLabel,DefaultStorageClass,DefaultTolerationSeconds,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,ResourceQuota" \
+    --kubernetes-version=v1.14.0 \
     --insecure-registry="localhost:5000" \
     --cpus=4 \
     --memory=8192 \

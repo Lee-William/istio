@@ -15,84 +15,66 @@
 package v2
 
 import (
-	"fmt"
+	"time"
+
+	"istio.io/istio/pkg/util/protomarshal"
 
 	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	"github.com/gogo/protobuf/types"
-	"github.com/prometheus/client_golang/prometheus"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/util"
 )
 
-func (s *DiscoveryServer) pushRoute(con *XdsConnection, push *model.PushContext) error {
-	rawRoutes, err := s.generateRawRoutes(con, push)
-	if err != nil {
-		return err
-	}
+func (s *DiscoveryServer) pushRoute(con *XdsConnection, push *model.PushContext, version string) error {
+	pushStart := time.Now()
+	rawRoutes := s.generateRawRoutes(con, push)
 	if s.DebugConfigs {
 		for _, r := range rawRoutes {
 			con.RouteConfigs[r.Name] = r
 			if adsLog.DebugEnabled() {
-				resp, _ := model.ToJSONWithIndent(r, " ")
-				adsLog.Debugf("RDS: Adding route %s for node %v", resp, con.modelNode)
+				resp, _ := protomarshal.ToJSONWithIndent(r, " ")
+				adsLog.Debugf("RDS: Adding route:%s for node:%v", resp, con.node.ID)
 			}
 		}
 	}
 
-	response := routeDiscoveryResponse(rawRoutes)
-	err = con.send(response)
+	response := routeDiscoveryResponse(rawRoutes, version, push.Version)
+	err := con.send(response)
+	rdsPushTime.Record(time.Since(pushStart).Seconds())
 	if err != nil {
-		adsLog.Warnf("ADS: RDS: Send failure %v: %v", con.modelNode.ID, err)
-		pushes.With(prometheus.Labels{"type": "rds_senderr"}).Add(1)
+		adsLog.Warnf("RDS: Send failure for node:%v: %v", con.node.ID, err)
+		recordSendError(rdsSendErrPushes, err)
 		return err
 	}
-	pushes.With(prometheus.Labels{"type": "rds"}).Add(1)
+	rdsPushes.Increment()
 
-	adsLog.Infof("ADS: RDS: PUSH for node: %s addr:%s routes:%d", con.modelNode.ID, con.PeerAddr, len(rawRoutes))
+	adsLog.Infof("RDS: PUSH for node:%s routes:%d", con.node.ID, len(rawRoutes))
 	return nil
 }
 
-func (s *DiscoveryServer) generateRawRoutes(con *XdsConnection, push *model.PushContext) ([]*xdsapi.RouteConfiguration, error) {
-	rc := make([]*xdsapi.RouteConfiguration, 0)
-	// TODO: Follow this logic for other xDS resources as well
-	// TODO: once per config update
-	for _, routeName := range con.Routes {
-		r, err := s.ConfigGenerator.BuildHTTPRoutes(s.Env, con.modelNode, push, routeName)
-		if err != nil {
-			retErr := fmt.Errorf("RDS: Failed to generate route %s for node %v: %v", routeName, con.modelNode, err)
-			adsLog.Warnf("RDS: Failed to generate routes for route %s for node %v: %v", routeName, con.modelNode, err)
-			pushes.With(prometheus.Labels{"type": "rds_builderr"}).Add(1)
-			return nil, retErr
-		}
-
-		if r == nil {
-			adsLog.Warnf("RDS: got nil value for route %s for node %v: %v", routeName, con.modelNode, err)
-			continue
-		}
-
-		if err = r.Validate(); err != nil {
-			retErr := fmt.Errorf("RDS: Generated invalid route %s for node %v: %v", routeName, con.modelNode, err)
-			adsLog.Errorf("RDS: Generated invalid routes for route %s for node %v: %v, %v", routeName, con.modelNode, err, r)
-			pushes.With(prometheus.Labels{"type": "rds_builderr"}).Add(1)
+func (s *DiscoveryServer) generateRawRoutes(con *XdsConnection, push *model.PushContext) []*xdsapi.RouteConfiguration {
+	rawRoutes := s.ConfigGenerator.BuildHTTPRoutes(s.Env, con.node, push, con.Routes)
+	// Now validate each route
+	for _, r := range rawRoutes {
+		if err := r.Validate(); err != nil {
+			adsLog.Errorf("RDS: Generated invalid routes for route:%s for node:%v: %v, %v", r.Name, con.node.ID, err, r)
+			rdsBuildErrPushes.Increment()
 			// Generating invalid routes is a bug.
-			// Panic instead of trying to recover from that, since we can't
-			// assume anything about the state.
-			panic(retErr.Error())
+			// Instead of panic, which will break down the whole cluster. Just ignore it here, let envoy process it.
 		}
-		rc = append(rc, r)
 	}
-	return rc, nil
+	return rawRoutes
 }
 
-func routeDiscoveryResponse(rs []*xdsapi.RouteConfiguration) *xdsapi.DiscoveryResponse {
+func routeDiscoveryResponse(rs []*xdsapi.RouteConfiguration, version string, noncePrefix string) *xdsapi.DiscoveryResponse {
 	resp := &xdsapi.DiscoveryResponse{
 		TypeUrl:     RouteType,
-		VersionInfo: versionInfo(),
-		Nonce:       nonce(),
+		VersionInfo: version,
+		Nonce:       nonce(noncePrefix),
 	}
 	for _, rc := range rs {
-		rr, _ := types.MarshalAny(rc)
-		resp.Resources = append(resp.Resources, *rr)
+		rr := util.MessageToAny(rc)
+		resp.Resources = append(resp.Resources, rr)
 	}
 
 	return resp

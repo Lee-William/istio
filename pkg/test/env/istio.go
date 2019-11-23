@@ -19,49 +19,54 @@ import (
 	"go/build"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"runtime"
 
-	"istio.io/istio/pkg/log"
+	"istio.io/pkg/log"
 )
 
 var (
 	// GOPATH environment variable
-	// nolint: golint
+	// nolint: golint, stylecheck
 	GOPATH Variable = "GOPATH"
 
 	// TOP environment variable
-	// nolint: golint
+	// nolint: golint, stylecheck
 	TOP Variable = "TOP"
 
 	// ISTIO_GO environment variable
-	// nolint: golint
+	// nolint: golint, stylecheck
 	ISTIO_GO Variable = "ISTIO_GO"
 
 	// ISTIO_BIN environment variable
-	// nolint: golint
+	// nolint: golint, stylecheck
 	ISTIO_BIN Variable = "ISTIO_BIN"
 
 	// ISTIO_OUT environment variable
-	// nolint: golint
+	// nolint: golint, stylecheck
 	ISTIO_OUT Variable = "ISTIO_OUT"
 
 	// HUB is the Docker hub to be used for images.
-	// nolint: golint
+	// nolint: golint, stylecheck
 	HUB Variable = "HUB"
 
 	// TAG is the Docker tag to be used for images.
-	// nolint: golint
+	// nolint: golint, stylecheck
 	TAG Variable = "TAG"
 
-	// PULL_POLICY is the image pull policy to use when rendering templates.
+	// BITNAMIHUB is the Docker registry to be used for the bitnami images.
 	// nolint: golint
+	BITNAMIHUB Variable = "BITNAMIHUB"
+
+	// PULL_POLICY is the image pull policy to use when rendering templates.
+	// nolint: golint, stylecheck
 	PULL_POLICY Variable = "PULL_POLICY"
 
 	// ISTIO_TEST_KUBE_CONFIG is the Kubernetes configuration file to use for testing. If a configuration file
 	// is specified on the command-line, that takes precedence.
-	// nolint: golint
+	// nolint: golint, stylecheck
 	ISTIO_TEST_KUBE_CONFIG Variable = "ISTIO_TEST_KUBE_CONFIG"
 
 	// IstioTop has the top of the istio tree, matches the env variable from make.
@@ -79,7 +84,7 @@ var (
 	// TODO: Some of these values are overlapping. We should re-align them.
 
 	// IstioRoot is the root of the Istio source repository.
-	IstioRoot = path.Join(GOPATH.Value(), "/src/istio.io/istio")
+	IstioRoot = path.Join(GOPATH.ValueOrDefault(build.Default.GOPATH), "/src/istio.io/istio")
 
 	// ChartsDir is the Kubernetes Helm chart directory in the repository
 	ChartsDir = path.Join(IstioRoot, "install/kubernetes/helm")
@@ -94,12 +99,21 @@ var (
 
 	// BookInfoKube is the book info folder that contains Yaml deployment files.
 	BookInfoKube = path.Join(BookInfoRoot, "platform/kube")
+
+	// ServiceAccountFilePath is the helm service account file.
+	ServiceAccountFilePath = path.Join(ChartsDir, "helm-service-account.yaml")
+
+	// RedisInstallFilePath is the redis installation file.
+	RedisInstallFilePath = path.Join(IstioRoot, "pkg/test/framework/components/redis/redis.yaml")
 )
 
 func getDefaultIstioTop() string {
 	// Assume it is run inside istio.io/istio
-	current, _ := os.Getwd()
-	idx := strings.Index(current, "/src/istio.io/istio")
+	current, err := os.Getwd()
+	if err != nil {
+		panic(err)
+	}
+	idx := strings.Index(current, filepath.Join("/src", "istio.io", "istio"))
 	if idx > 0 {
 		return current[0:idx]
 	}
@@ -123,6 +137,12 @@ func verifyFile(v Variable, f string) string {
 }
 
 func fileExists(f string) bool {
-	_, err := os.Stat(f)
-	return !os.IsNotExist(err)
+	return CheckFileExists(f) == nil
+}
+
+func CheckFileExists(path string) error {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }

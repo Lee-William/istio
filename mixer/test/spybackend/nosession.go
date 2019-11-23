@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // nolint:lll
-//go:generate go run $GOPATH/src/istio.io/istio/mixer/tools/mixgen/main.go adapter -n spybackend-nosession -s=false -t metric -t quota -t listentry -t apa -t checkoutput -o nosession.yaml
+//go:generate go run $REPO_ROOT/mixer/tools/mixgen/main.go adapter -n spybackend-nosession -s=false -t metric -t quota -t listentry -t apa -t checkoutput -o nosession.yaml
 
 package spybackend
 
@@ -214,7 +214,6 @@ func (s *NoSessionServer) Close() error {
 	return nil
 }
 
-// GetCapturedCalls ...
 func (s *NoSessionServer) GetCapturedCalls() []spyadapter.CapturedCall {
 	return s.CapturedCalls
 }

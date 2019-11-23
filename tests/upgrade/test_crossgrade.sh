@@ -1,5 +1,19 @@
 #!/bin/bash
 
+# Copyright Istio Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # This test checks for control and data plane crossgrade. It runs the following steps:
 # 1. Installs istio with multiple gateway replicas at from_hub/tag/path (path must point to a dir with release).
 # 2. Installs fortio echosrv with a couple of different subsets/destination rules with multiple replicas.
@@ -24,28 +38,37 @@ usage() {
     echo "Usage:"
     echo "  ./test_crossgrade.sh [OPTIONS]"
     echo
-    echo "  from_hub      hub of release to upgrade from (required)."
-    echo "  from_tag      tag of release to upgrade from (required)."
-    echo "  from_path     path to release dir to upgrade from (required)."
-    echo "  to_hub        hub of release to upgrade to (required)."
-    echo "  to_tag        tag of release to upgrade to (required)."
-    echo "  to_path       path to release to upgrade to (required)."
-    echo "  auth_enable   enable mtls."
-    echo "  skip_cleanup  leave install intact after test completes."
-    echo "  namespace     namespace to install istio control plane in (default istio-system)."
-    echo "  cloud         cloud provider name (required)"
+    echo "  from_hub          hub of release to upgrade from (required)."
+    echo "  from_tag          tag of release to upgrade from (required)."
+    echo "  from_path         path to release dir to upgrade from (required)."
+    echo "  to_hub            hub of release to upgrade to (required)."
+    echo "  to_tag            tag of release to upgrade to (required)."
+    echo "  to_path           path to release to upgrade to (required)."
+    echo "  install_options   install istio using either helm or istioctl (required)."
+    echo "  auth_enable       enable mtls."
+    echo "  skip_cleanup      leave install intact after test completes."
+    echo "  namespace         namespace to install istio control plane in (default istio-system)."
+    echo "  cloud             cloud provider name (required)"
     echo
     echo "  e.g. ./test_crossgrade.sh \"
     echo "        --from_hub=gcr.io/istio-testing --from_tag=d639408fd --from_path=/tmp/release-d639408fd \"
     echo "        --to_hub=gcr.io/istio-release --to_tag=1.0.2 --to_path=/tmp/istio-1.0.2 --cloud=GKE"
+    echo "        --install_options=helm"
     echo
     exit 1
 }
 
 ISTIO_NAMESPACE="istio-system"
-# Minimum % of all requests that must be 200 for test to pass.
-MIN_200_PCT_FOR_PASS="85"
+# Maximum % of 503 response that cannot exceed
+MAX_503_PCT_FOR_PASS="15"
+# Maximum % of connection refused that cannot exceed
+# Set it to high value so it fails for explicit sidecar issues
+MAX_CONNECTION_ERR_FOR_PASS="30"
+SERVICE_UNAVAILABLE_CODE="503"
+CONNECTION_ERROR_CODE="-1"
 
+# TODO: later on, we add one more flag about supporting user specify the profile yaml file for upgrade
+# Currently, we are supporting the default profiles
 while (( "$#" )); do
     PARAM=$(echo "${1}" | awk -F= '{print $1}')
     eval VALUE="$(echo "${1}" | awk -F= '{print $2}')"
@@ -81,6 +104,9 @@ while (( "$#" )); do
         --to_path)
             TO_PATH=${VALUE}
             ;;
+        --install_options)
+            INSTALL_OPTIONS=${VALUE}
+            ;;
         --cloud)
             CLOUD=${VALUE}
             ;;
@@ -93,8 +119,8 @@ while (( "$#" )); do
     shift
 done
 
-if [[ -z "${FROM_HUB}" || -z "${FROM_TAG}" || -z "${FROM_PATH}" || -z "${TO_HUB}" || -z "${TO_TAG}" || -z "${TO_PATH}" ]]; then
-    echo "Error: from_hub, from_tag, from_path, to_hub, to_tag, to_path must all be set."
+if [[ -z "${FROM_HUB}" || -z "${FROM_TAG}" || -z "${FROM_PATH}" || -z "${TO_HUB}" || -z "${TO_TAG}" || -z "${TO_PATH}" || -z "${INSTALL_OPTIONS}" ]]; then
+    echo "Error: from_hub, from_tag, from_path, to_hub, to_tag, to_path, install_options must all be set."
     exit 1
 fi
 
@@ -182,45 +208,76 @@ deleteWithWait() {
     withRetries 60 10 checkIfDeleted "${1}" "${2}" "${3}"
 }
 
-installIstioSystemAtVersionHelmTemplate() {
+installIstioAtVersionUsingHelm() {
     writeMsg "helm templating then applying new yaml using version ${2} from ${3}."
     if [ -n "${AUTH_ENABLE}" ]; then
         echo "Auth is enabled, generating manifest with auth."
         auth_opts="--set global.mtls.enabled=true --set global.controlPlaneSecurityEnabled=true "
     fi
     release_path="${3}"/install/kubernetes/helm/istio
-    if [[ "${release_path}" == *"1.1"* || "${release_path}" == *"master"* ]]; then
-        # See https://preliminary.istio.io/docs/setup/kubernetes/helm-install/
-        helm init --client-only
-        for i in install/kubernetes/helm/istio-init/files/crd*yaml; do
-            echo_and_run kubectl apply -f "${i}"
-        done
-        sleep 5 # Per official Istio documentation!
 
-        helm template "${release_path}" "${auth_opts}" \
-        --name istio --namespace "${ISTIO_NAMESPACE}" \
-        --set gateways.istio-ingressgateway.autoscaleMin=4 \
-        --set pilot.autoscaleMin=2 \
-        --set mixer.telemetry.autoscaleMin=2 \
-        --set mixer.policy.autoscaleMin=2 \
-        --set prometheus.enabled=false \
-        --set global.hub="${1}" \
-        --set global.tag="${2}" \
-        --set global.defaultPodDisruptionBudget.enabled=true > "${ISTIO_ROOT}/istio.yaml" || die "helm template failed"
-    else
-        helm template "${release_path}" "${auth_opts}" \
-        --name istio --namespace "${ISTIO_NAMESPACE}" \
-        --set gateways.istio-ingressgateway.autoscaleMin=4 \
-        --set pilot.autoscaleMin=2 \
-        --set mixer.istio-telemetry.autoscaleMin=2 \
-        --set mixer.istio-policy.autoscaleMin=2 \
-        --set prometheus.enabled=false \
-        --set global.hub="${1}" \
-        --set global.tag="${2}" > "${ISTIO_ROOT}/istio.yaml" || die "helm template failed"
-    fi
+    # See https://preliminary.istio.io/docs/setup/kubernetes/helm-install/
+    helm init --client-only
+    for i in "${3}"/install/kubernetes/helm/istio-init/files/crd*yaml; do
+        echo_and_run kubectl apply -f "${i}"
+    done
+    sleep 5 # Per official Istio documentation!
 
+    helm template "${release_path}" "${auth_opts}" \
+    --name istio --namespace "${ISTIO_NAMESPACE}" \
+    --set gateways.istio-ingressgateway.autoscaleMin=4 \
+    --set pilot.autoscaleMin=2 \
+    --set mixer.telemetry.autoscaleMin=2 \
+    --set mixer.policy.autoscaleMin=2 \
+    --set global.proxy.accessLogFile="/dev/stdout" \
+    --set prometheus.enabled=false \
+    --set-string global.hub="${1}" \
+    --set-string global.tag="${2}" \
+    --set global.defaultPodDisruptionBudget.enabled=true > "${ISTIO_ROOT}/istio.yaml" || die "helm template failed"
 
-    withRetries 3 60 kubectl apply -f "${ISTIO_ROOT}"/istio.yaml
+    kubectl apply -f "${ISTIO_ROOT}"/istio.yaml
+}
+
+installIstioAtVersionUsingIstioctl(){
+  writeMsg "istioctl install istio using version ${2} from ${3}."
+  istioctl_path="${3}"/bin
+  "${istioctl_path}"/istioctl experimental manifest apply --skip-confirmation
+}
+
+# istioctl x upgrade supports upgrade istio release version
+# from 1.3.x to 1.4.0
+# 1.3.3 to 1.4.0
+# 1.3.0 to 1.4.0 --force
+upgradeIstioAtVersionUsingIstioctl(){
+  writeMsg "istioctl upgrade istio using version ${2} from ${3}."
+  istioctl_path="${3}"/bin
+  if "${FROM_TAG}" < "1.3.3"; then
+    "${istioctl_path}"/istioctl experimental manifest upgrade --skip-confirmation --force
+  else
+    "${istioctl_path}"/istioctl experimental manifest upgrade --skip-confirmation
+  fi
+}
+
+istioInstallOptions() {
+  if [[ "${INSTALL_OPTIONS}" == "helm" ]];then
+    installIstioAtVersionUsingHelm "${FROM_HUB}" "${FROM_TAG}" "${FROM_PATH}"
+  elif [[ "${INSTALL_OPTIONS}" == "istioctl" ]];then
+    installIstioAtVersionUsingIstioctl "${FROM_HUB}" "${FROM_TAG}" "${FROM_PATH}"
+  else
+    echo "--install_options flag only support helm and istioctl options"
+    exit 1
+  fi
+}
+
+istioUpgradeOptions(){
+  if [[ "${INSTALL_OPTIONS}" == "helm" ]];then
+    installIstioAtVersionUsingHelm "${TO_HUB}" "${TO_TAG}" "${TO_PATH}"
+  elif [[ "${INSTALL_OPTIONS}" == "istioctl" ]];then
+    upgradeIstioAtVersionUsingIstioctl "${TO_HUB}" "${TO_TAG}" "${TO_PATH}"
+  else
+    echo "--install_options flag only support helm and istioctl options"
+    exit 1
+  fi
 }
 
 installTest() {
@@ -253,7 +310,7 @@ sendInternalRequestTraffic() {
 
 # Runs traffic from external fortio client, with retries.
 runFortioLoadCommand() {
-    withRetries 10 10  echo_and_run fortio load -c 32 -t "${TRAFFIC_RUNTIME_SEC}"s -qps 10 \
+    withRetries 10 10  echo_and_run fortio load -c 32 -t "${TRAFFIC_RUNTIME_SEC}"s -qps 10 -timeout 30s\
         -H "Host:echosrv.test.svc.cluster.local" "http://${1}/echo?size=200" &> "${LOCAL_FORTIO_LOG}"
     echo "done" >> "${EXTERNAL_FORTIO_DONE_FILE}"
 }
@@ -268,7 +325,7 @@ waitForExternalRequestTraffic() {
 # Sends external traffic from machine test is running on to Fortio echosrv through external IP and ingress gateway LB.
 sendExternalRequestTraffic() {
     writeMsg "Sending external traffic"
-    runFortioLoadCommand "${1}" &
+    runFortioLoadCommand "${1}"
 }
 
 restartDataPlane() {
@@ -365,19 +422,22 @@ resetCluster() {
     echo_and_run_or_die kubectl label namespace "${TEST_NAMESPACE}" istio-injection=enabled
 }
 
-# Returns 0 if the passed string has form "Code 200 : 6601 (94.6 %)" and the percentage is smaller than ${MIN_200_PCT_FOR_PASS}
-percent200sAbove() {
-    local s=$1
-    local regex="Code 200 : [0-9]+ \\(([0-9]+)\\.[0-9]+ %\\)"
-    if [[ $s =~ $regex ]]; then
-        local pct200s="${BASH_REMATCH[1]}"
-        if (( pct200s > MIN_200_PCT_FOR_PASS )); then
-            return 0
-        fi
-        return 1
-    fi
-    echo "No Code 200 percentage found in log."
-    return 1
+# Return 1 if the specific error code percentage exceed corresponding threshold
+errorPercentBelow() {
+     local LOG=${1}
+     local ERR_CODE=${2}
+     local LIMIT=${3}
+     local s
+     s=$(grep "Code ${ERR_CODE}" "${LOG}")
+     local regex="Code ${ERR_CODE} : [0-9]+ \\(([0-9]+)\\.[0-9]+ %\\)"
+     if [[ ${s} =~ ${regex} ]]; then
+          local pctErr="${BASH_REMATCH[1]}"
+          if (( pctErr > LIMIT )); then
+             return 1
+          fi
+             echo "Errors percentage is within threshold"
+     fi
+     return 0
 }
 
 die() {
@@ -405,7 +465,7 @@ echo_and_run pushd "${ISTIO_ROOT}"
 
 resetCluster
 
-installIstioSystemAtVersionHelmTemplate "${FROM_HUB}" "${FROM_TAG}" "${FROM_PATH}"
+istioInstallOptions
 waitForIngress
 waitForPodsReady "${ISTIO_NAMESPACE}"
 
@@ -418,12 +478,12 @@ checkEchosrv
 
 # Run internal traffic in the background since we may have to relaunch it if the job fails.
 sendInternalRequestTraffic &
-sendExternalRequestTraffic "${INGRESS_ADDR}"
+sendExternalRequestTraffic "${INGRESS_ADDR}" &   # TODO: if we wait this to finish, all the following steps will succeed.
 # Let traffic clients establish all connections. There's some small startup delay, this covers it.
 echo "Waiting for traffic to settle..."
 sleep 20
 
-installIstioSystemAtVersionHelmTemplate "${TO_HUB}" "${TO_TAG}" "${TO_PATH}"
+istioUpgradeOptions
 waitForPodsReady "${ISTIO_NAMESPACE}"
 # In principle it should be possible to restart data plane immediately, but being conservative here.
 sleep 60
@@ -434,13 +494,12 @@ restartDataPlane echosrv-deployment-v1
 sleep 140
 
 # Now do a rollback. In a rollback, we update the data plane first.
-writeMsg "Starting rollback - first, rolling back data plane to ${TO_PATH}"
+writeMsg "Starting rollback - first, rolling back data plane to ${FROM_PATH}"
 resetConfigMap istio-sidecar-injector "${TMP_DIR}"/sidecar-injector-configmap.yaml
 restartDataPlane echosrv-deployment-v1
 sleep 140
 
-
-installIstioSystemAtVersionHelmTemplate "${FROM_HUB}" "${FROM_TAG}" "${FROM_PATH}"
+istioInstallOptions
 waitForPodsReady "${ISTIO_NAMESPACE}"
 
 echo "Test ran for ${SECONDS} seconds."
@@ -462,23 +521,30 @@ cat ${LOCAL_FORTIO_LOG}
 if [[ ${local_log_str} != *"Code 200"* ]];then
     echo "=== No Code 200 found in external traffic log ==="
     failed=true
-elif ! percent200sAbove "${local_log_str}"; then
-    echo "=== Errors found in external traffic exceeded ${MIN_200_PCT_FOR_PASS}% threshold ==="
+elif ! errorPercentBelow "${LOCAL_FORTIO_LOG}" "${SERVICE_UNAVAILABLE_CODE}" ${MAX_503_PCT_FOR_PASS}; then
+    echo "=== Code 503 Errors found in external traffic exceeded ${MAX_503_PCT_FOR_PASS}% threshold ==="
+    failed=true
+elif ! errorPercentBelow "${LOCAL_FORTIO_LOG}" "${CONNECTION_ERROR_CODE}" ${MAX_CONNECTION_ERR_FOR_PASS}; then
+    echo "=== Connection Errors found in external traffic exceeded ${MAX_CONNECTION_ERR_FOR_PASS}% threshold ==="
     failed=true
 else
-    echo "=== Errors found in external traffic is within ${MIN_200_PCT_FOR_PASS}% threshold ==="
+    echo "=== Errors found in external traffic is within threshold ==="
 fi
 
 # Then dump pod log
 cat ${POD_FORTIO_LOG}
-if [[ ${pod_log_str}  != *"Code 200"* ]]; then
+
+if [[ ${pod_log_str} != *"Code 200"* ]];then
     echo "=== No Code 200 found in internal traffic log ==="
     failed=true
-elif ! percent200sAbove "${pod_log_str}"; then
-    echo "=== Errors found in internal traffic exceeded ${MIN_200_PCT_FOR_PASS}% threshold ==="
+elif ! errorPercentBelow "${POD_FORTIO_LOG}" "${SERVICE_UNAVAILABLE_CODE}" ${MAX_503_PCT_FOR_PASS}; then
+    echo "=== Code 503 Errors found in internal traffic exceeded ${MAX_503_PCT_FOR_PASS}% threshold ==="
+    failed=true
+elif ! errorPercentBelow "${POD_FORTIO_LOG}" "${CONNECTION_ERROR_CODE}" ${MAX_CONNECTION_ERR_FOR_PASS}; then
+    echo "=== Connection Errors found in internal traffic exceeded ${MAX_CONNECTION_ERR_FOR_PASS}% threshold ==="
     failed=true
 else
-    echo "=== Errors found in internal traffic is within ${MIN_200_PCT_FOR_PASS}% threshold ==="
+    echo "=== Errors found in internal traffic is within threshold ==="
 fi
 
 echo_and_run popd

@@ -17,20 +17,21 @@ package cmd
 import (
 	"flag"
 	"fmt"
-	"time"
+	"reflect"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 
-	"istio.io/istio/galley/pkg/crd/validation"
 	"istio.io/istio/galley/pkg/server"
+	"istio.io/istio/galley/pkg/server/settings"
 	istiocmd "istio.io/istio/pkg/cmd"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/probe"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/pkg/log"
 )
 
 var (
-	resyncPeriod   time.Duration
-	kubeConfig     string
 	loggingOptions = log.DefaultOptions()
 )
 
@@ -38,18 +39,10 @@ var (
 func serverCmd() *cobra.Command {
 
 	var (
-		serverArgs               = server.DefaultArgs()
-		validationArgs           = validation.DefaultArgs()
-		livenessProbeOptions     probe.Options
-		readinessProbeOptions    probe.Options
-		livenessProbeController  probe.Controller
-		readinessProbeController probe.Controller
-		monitoringPort           uint
-		enableProfiling          bool
-		pprofPort                uint
+		serverArgs = settings.DefaultArgs()
 	)
 
-	serverCmd := &cobra.Command{
+	svr := &cobra.Command{
 		Use:          "server",
 		Short:        "Starts Galley as a server",
 		SilenceUsage: true,
@@ -61,116 +54,184 @@ func serverCmd() *cobra.Command {
 			return err
 		},
 		Run: func(cmd *cobra.Command, args []string) {
-			serverArgs.KubeConfig = kubeConfig
-			serverArgs.ResyncPeriod = resyncPeriod
-			serverArgs.CredentialOptions.CACertificateFile = validationArgs.CACertFile
-			serverArgs.CredentialOptions.KeyFile = validationArgs.KeyFile
-			serverArgs.CredentialOptions.CertificateFile = validationArgs.CertFile
-			if livenessProbeOptions.IsValid() {
-				livenessProbeController = probe.NewFileController(&livenessProbeOptions)
+			// Retrieve Viper values for each Cobra Val Flag
+			viper.SetTypeByDefaultValue(true)
+			cmd.PersistentFlags().VisitAll(func(f *pflag.Flag) {
+				if reflect.TypeOf(viper.Get(f.Name)).Kind() == reflect.Slice {
+					// Viper cannot convert slices to strings, so this is our workaround.
+					_ = f.Value.Set(strings.Join(viper.GetStringSlice(f.Name), ","))
+				} else {
+					_ = f.Value.Set(viper.GetString(f.Name))
+				}
+			})
+
+			// validation tls args fall back to server arg values
+			// since the default value for these flags is an empty string, zero length indicates not set
+			if len(serverArgs.ValidationArgs.CACertFile) < 1 {
+				serverArgs.ValidationArgs.CACertFile = serverArgs.CredentialOptions.CACertificateFile
 			}
-			if readinessProbeOptions.IsValid() {
-				readinessProbeController = probe.NewFileController(&readinessProbeOptions)
+			if len(serverArgs.ValidationArgs.CertFile) < 1 {
+				serverArgs.ValidationArgs.CertFile = serverArgs.CredentialOptions.CertificateFile
 			}
-			if !serverArgs.EnableServer && !validationArgs.EnableValidation {
+			if len(serverArgs.ValidationArgs.KeyFile) < 1 {
+				serverArgs.ValidationArgs.KeyFile = serverArgs.CredentialOptions.KeyFile
+			}
+
+			if !serverArgs.EnableServer && !serverArgs.ValidationArgs.EnableValidation {
 				log.Fatala("Galley must be running under at least one mode: server or validation")
 			}
 
-			if err := validationArgs.Validate(); err != nil {
+			if err := serverArgs.ValidationArgs.Validate(); err != nil {
 				log.Fatalf("Invalid validationArgs: %v", err)
 			}
 
-			if serverArgs.EnableServer {
-				go server.RunServer(serverArgs, livenessProbeController, readinessProbeController)
+			s := server.New(serverArgs)
+			if err := s.Start(); err != nil {
+				log.Fatalf("Error creating server: %v", err)
 			}
-			if validationArgs.EnableValidation {
-				go validation.RunValidation(validationArgs, kubeConfig, livenessProbeController, readinessProbeController)
-			}
+
 			galleyStop := make(chan struct{})
-			go server.StartSelfMonitoring(galleyStop, monitoringPort)
-
-			if enableProfiling {
-				go server.StartProfiling(galleyStop, pprofPort)
-			}
-
-			go server.StartProbeCheck(livenessProbeController, readinessProbeController, galleyStop)
 			istiocmd.WaitSignal(galleyStop)
+			s.Stop()
 		},
 	}
 
-	serverCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
-	serverCmd.PersistentFlags().StringVar(&kubeConfig, "kubeconfig", "",
+	svr.PersistentFlags().AddGoFlagSet(flag.CommandLine)
+	svr.PersistentFlags().StringVar(&serverArgs.KubeConfig, "kubeconfig", serverArgs.KubeConfig,
 		"Use a Kubernetes configuration file instead of in-cluster configuration")
-	serverCmd.PersistentFlags().DurationVar(&resyncPeriod, "resyncPeriod", 0,
+	svr.PersistentFlags().DurationVar(&serverArgs.ResyncPeriod, "resyncPeriod", serverArgs.ResyncPeriod,
 		"Resync period for rescanning Kubernetes resources")
-	serverCmd.PersistentFlags().StringVar(&validationArgs.CertFile, "tlsCertFile", "/etc/certs/cert-chain.pem",
+	svr.PersistentFlags().StringVar(&serverArgs.CredentialOptions.CertificateFile, "tlsCertFile", constants.DefaultCertChain,
 		"File containing the x509 Certificate for HTTPS.")
-	serverCmd.PersistentFlags().StringVar(&validationArgs.KeyFile, "tlsKeyFile", "/etc/certs/key.pem",
+	svr.PersistentFlags().StringVar(&serverArgs.CredentialOptions.KeyFile, "tlsKeyFile", constants.DefaultKey,
 		"File containing the x509 private key matching --tlsCertFile.")
-	serverCmd.PersistentFlags().StringVar(&validationArgs.CACertFile, "caCertFile", "/etc/certs/root-cert.pem",
+	svr.PersistentFlags().StringVar(&serverArgs.CredentialOptions.CACertificateFile, "caCertFile", constants.DefaultRootCert,
 		"File containing the caBundle that signed the cert/key specified by --tlsCertFile and --tlsKeyFile.")
-	serverCmd.PersistentFlags().StringVar(&livenessProbeOptions.Path, "livenessProbePath", server.DefaultLivenessProbeFilePath,
+	svr.PersistentFlags().StringVar(&serverArgs.Liveness.Path, "livenessProbePath", serverArgs.Liveness.Path,
 		"Path to the file for the Galley liveness probe.")
-	serverCmd.PersistentFlags().DurationVar(&livenessProbeOptions.UpdateInterval, "livenessProbeInterval", server.DefaultProbeCheckInterval,
+	svr.PersistentFlags().DurationVar(&serverArgs.Liveness.UpdateInterval, "livenessProbeInterval", serverArgs.Liveness.UpdateInterval,
 		"Interval of updating file for the Galley liveness probe.")
-	serverCmd.PersistentFlags().StringVar(&readinessProbeOptions.Path, "readinessProbePath", server.DefaultReadinessProbeFilePath,
+	svr.PersistentFlags().StringVar(&serverArgs.Readiness.Path, "readinessProbePath", serverArgs.Readiness.Path,
 		"Path to the file for the Galley readiness probe.")
-	serverCmd.PersistentFlags().DurationVar(&readinessProbeOptions.UpdateInterval, "readinessProbeInterval", server.DefaultProbeCheckInterval,
+	svr.PersistentFlags().DurationVar(&serverArgs.Readiness.UpdateInterval, "readinessProbeInterval", serverArgs.Readiness.UpdateInterval,
 		"Interval of updating file for the Galley readiness probe.")
-	serverCmd.PersistentFlags().UintVar(&monitoringPort, "monitoringPort", 15014,
+	svr.PersistentFlags().UintVar(&serverArgs.MonitoringPort, "monitoringPort", serverArgs.MonitoringPort,
 		"Port to use for exposing self-monitoring information")
-	serverCmd.PersistentFlags().UintVar(&pprofPort, "pprofPort", 9094, "Port to use for exposing profiling")
-	serverCmd.PersistentFlags().BoolVar(&enableProfiling, "enableProfiling", false,
+	svr.PersistentFlags().UintVar(&serverArgs.PprofPort, "pprofPort", serverArgs.PprofPort, "Port to use for exposing profiling")
+	svr.PersistentFlags().BoolVar(&serverArgs.EnableProfiling, "enableProfiling", serverArgs.EnableProfiling,
 		"Enable profiling for Galley")
 
 	// server config
-	serverCmd.PersistentFlags().StringVarP(&serverArgs.APIAddress, "server-address", "", serverArgs.APIAddress,
-		"Address to use for Galley's gRPC API, e.g. tcp://127.0.0.1:9092 or unix:///path/to/file")
-	serverCmd.PersistentFlags().UintVarP(&serverArgs.MaxReceivedMessageSize, "server-maxReceivedMessageSize", "", serverArgs.MaxReceivedMessageSize,
+	svr.PersistentFlags().StringVarP(&serverArgs.APIAddress, "server-address", "", serverArgs.APIAddress,
+		"Address to use for Galley's gRPC API, e.g. tcp://localhost:9092 or unix:///path/to/file")
+	svr.PersistentFlags().UintVarP(&serverArgs.MaxReceivedMessageSize, "server-maxReceivedMessageSize", "", serverArgs.MaxReceivedMessageSize,
 		"Maximum size of individual gRPC messages")
-	serverCmd.PersistentFlags().UintVarP(&serverArgs.MaxConcurrentStreams, "server-maxConcurrentStreams", "", serverArgs.MaxConcurrentStreams,
+	svr.PersistentFlags().UintVarP(&serverArgs.MaxConcurrentStreams, "server-maxConcurrentStreams", "", serverArgs.MaxConcurrentStreams,
 		"Maximum number of outstanding RPCs per connection")
-	serverCmd.PersistentFlags().BoolVarP(&serverArgs.Insecure, "insecure", "", serverArgs.Insecure,
+	svr.PersistentFlags().BoolVarP(&serverArgs.Insecure, "insecure", "", serverArgs.Insecure,
 		"Use insecure gRPC communication")
-	serverCmd.PersistentFlags().BoolVar(&serverArgs.EnableServer, "enable-server", serverArgs.EnableServer, "Run galley server mode")
-	serverCmd.PersistentFlags().StringVarP(&serverArgs.AccessListFile, "accessListFile", "", serverArgs.AccessListFile,
-		"The access list yaml file that contains the allowd mTLS peer ids.")
-	serverCmd.PersistentFlags().StringVar(&serverArgs.ConfigPath, "configPath", serverArgs.ConfigPath,
+	svr.PersistentFlags().BoolVar(&serverArgs.EnableServer, "enable-server", serverArgs.EnableServer, "Run galley server mode")
+	svr.PersistentFlags().StringVarP(&serverArgs.AccessListFile, "accessListFile", "", serverArgs.AccessListFile,
+		"The access list yaml file that contains the allowed mTLS peer ids.")
+	svr.PersistentFlags().StringVar(&serverArgs.ConfigPath, "configPath", serverArgs.ConfigPath,
 		"Istio config file path")
-	serverCmd.PersistentFlags().StringVar(&serverArgs.MeshConfigFile, "meshConfigFile", serverArgs.MeshConfigFile,
+	svr.PersistentFlags().StringVar(&serverArgs.MeshConfigFile, "meshConfigFile", serverArgs.MeshConfigFile,
 		"Path to the mesh config file")
-	serverCmd.PersistentFlags().StringVar(&serverArgs.DomainSuffix, "domain", serverArgs.DomainSuffix,
+	svr.PersistentFlags().StringVar(&serverArgs.DomainSuffix, "domain", serverArgs.DomainSuffix,
 		"DNS domain suffix")
-	serverCmd.PersistentFlags().BoolVar(&serverArgs.DisableResourceReadyCheck, "disableResourceReadyCheck", serverArgs.DisableResourceReadyCheck,
+	svr.PersistentFlags().BoolVar(&serverArgs.DisableResourceReadyCheck, "disableResourceReadyCheck", serverArgs.DisableResourceReadyCheck,
 		"Disable resource readiness checks. This allows Galley to start if not all resource types are supported")
-	serverCmd.PersistentFlags().StringSliceVar(&serverArgs.ExcludedResourceKinds, "excludedResourceKinds",
+	_ = svr.PersistentFlags().MarkDeprecated("disableResourceReadyCheck", "")
+	svr.PersistentFlags().StringSliceVar(&serverArgs.ExcludedResourceKinds, "excludedResourceKinds",
 		serverArgs.ExcludedResourceKinds, "Comma-separated list of resource kinds that should not generate source events")
-	serverCmd.PersistentFlags().StringVar(&serverArgs.SinkAddress, "sinkAddress",
+	_ = svr.PersistentFlags().MarkDeprecated("excludedResourceKinds", "")
+	svr.PersistentFlags().StringVar(&serverArgs.SinkAddress, "sinkAddress",
 		serverArgs.SinkAddress, "Address of MCP Resource Sink server for Galley to connect to. Ex: 'foo.com:1234'")
-	serverCmd.PersistentFlags().StringVar(&serverArgs.SinkAuthMode, "sinkAuthMode",
+	svr.PersistentFlags().StringVar(&serverArgs.SinkAuthMode, "sinkAuthMode",
 		serverArgs.SinkAuthMode, "Name of authentication plugin to use for connection to sink server.")
-	serverCmd.PersistentFlags().StringSliceVar(&serverArgs.SinkMeta, "sinkMeta",
+	svr.PersistentFlags().StringSliceVar(&serverArgs.SinkMeta, "sinkMeta",
 		serverArgs.SinkMeta, "Comma-separated list of key=values to attach as metadata to outgoing sink connections. Ex: 'key=value,key2=value2'")
+	svr.PersistentFlags().BoolVar(&serverArgs.EnableServiceDiscovery, "enableServiceDiscovery", false,
+		"Enable service discovery processing in Galley")
+	svr.PersistentFlags().BoolVar(&serverArgs.UseOldProcessor, "useOldProcessor", serverArgs.UseOldProcessor,
+		"Use the old processing pipeline for config processing")
+	svr.PersistentFlags().BoolVar(&serverArgs.WatchConfigFiles, "watchConfigFiles", serverArgs.WatchConfigFiles,
+		"Enable the Fsnotify for watching config source files on the disk and implicit signaling on a config change. Explicit signaling will still be enabled")
+	svr.PersistentFlags().BoolVar(&serverArgs.EnableConfigAnalysis, "enableAnalysis", serverArgs.EnableConfigAnalysis,
+		"Enable config analysis service")
 
 	// validation config
-	serverCmd.PersistentFlags().StringVar(&validationArgs.WebhookConfigFile,
+	svr.PersistentFlags().StringVar(&serverArgs.ValidationArgs.WebhookConfigFile,
 		"validation-webhook-config-file", "",
-		"File that contains k8s validatingwebhookconfiguration yaml. Validation is disabled if file is not specified")
-	serverCmd.PersistentFlags().UintVar(&validationArgs.Port, "validation-port", 443,
-		"HTTPS port of the validation service. Must be 443 if service has more than one port ")
-	serverCmd.PersistentFlags().BoolVar(&validationArgs.EnableValidation, "enable-validation", validationArgs.EnableValidation,
+		"File that contains k8s validatingwebhookconfiguration yaml. Required if enable-validation is true.")
+	svr.PersistentFlags().UintVar(&serverArgs.ValidationArgs.Port, "validation-port",
+		serverArgs.ValidationArgs.Port, "HTTPS port of the validation service.")
+	svr.PersistentFlags().BoolVar(&serverArgs.ValidationArgs.EnableValidation, "enable-validation", serverArgs.ValidationArgs.EnableValidation,
 		"Run galley validation mode")
-	serverCmd.PersistentFlags().StringVar(&validationArgs.DeploymentAndServiceNamespace, "deployment-namespace", "istio-system",
+	svr.PersistentFlags().BoolVar(&serverArgs.ValidationArgs.EnableReconcileWebhookConfiguration,
+		"enable-reconcileWebhookConfiguration", serverArgs.ValidationArgs.EnableReconcileWebhookConfiguration,
+		"Enable reconciliation for webhook configuration.")
+	svr.PersistentFlags().StringVar(&serverArgs.ValidationArgs.DeploymentAndServiceNamespace, "deployment-namespace", "istio-system",
 		"Namespace of the deployment for the validation pod")
-	serverCmd.PersistentFlags().StringVar(&validationArgs.DeploymentName, "deployment-name", "istio-galley",
+	svr.PersistentFlags().StringVar(&serverArgs.ValidationArgs.DeploymentName, "deployment-name", "istio-galley",
 		"Name of the deployment for the validation pod")
-	serverCmd.PersistentFlags().StringVar(&validationArgs.ServiceName, "service-name", "istio-galley",
+	svr.PersistentFlags().StringVar(&serverArgs.ValidationArgs.ServiceName, "service-name", "istio-galley",
 		"Name of the validation service running in the same namespace as the deployment")
-	serverCmd.PersistentFlags().StringVar(&validationArgs.WebhookName, "webhook-name", "istio-galley",
+	svr.PersistentFlags().StringVar(&serverArgs.ValidationArgs.WebhookName, "webhook-name", "istio-galley",
 		"Name of the k8s validatingwebhookconfiguration")
 
-	serverArgs.IntrospectionOptions.AttachCobraFlags(serverCmd)
-	loggingOptions.AttachCobraFlags(serverCmd)
+	// Hidden, file only flags for validation specific TLS
+	svr.PersistentFlags().StringVar(&serverArgs.ValidationArgs.CertFile, "validation.tls.clientCertificate", "",
+		"File containing the x509 Certificate for HTTPS validation.")
+	svr.PersistentFlags().StringVar(&serverArgs.ValidationArgs.KeyFile, "validation.tls.privateKey", "",
+		"File containing the x509 private key matching --validation.tls.clientCertificate.")
+	svr.PersistentFlags().StringVar(&serverArgs.ValidationArgs.CACertFile, "validation.tls.caCertificates", "",
+		"File containing the caBundle that signed the cert/key specified by --validation.tls.clientCertificate and --validation.tls.privateKey.")
 
-	return serverCmd
+	serverArgs.IntrospectionOptions.AttachCobraFlags(svr)
+	loggingOptions.AttachCobraFlags(svr)
+	_ = viper.BindPFlags(svr.PersistentFlags())
+
+	cobra.OnInitialize(setupAliases)
+
+	return svr
+}
+
+func setupAliases() {
+	// setup viper Aliases for hierarchical config files
+	// this must be run after all config sources have been read.
+	viper.RegisterAlias("general.kubeconfig", "kubeconfig")
+	viper.RegisterAlias("general.introspection.port", "ctrlz_port")
+	viper.RegisterAlias("general.introspection.address", "ctrlz_address")
+	viper.RegisterAlias("general.liveness.path", "livenessProbePath")
+	viper.RegisterAlias("general.liveness.interval", "livenessProbeInterval")
+	viper.RegisterAlias("general.readiness.path", "readinessProbePath")
+	viper.RegisterAlias("general.readiness.interval", "readinessProbeInterval")
+	viper.RegisterAlias("general.meshConfigFile", "meshConfigFile")
+	viper.RegisterAlias("general.monitoringPort", "monitoringPort")
+	viper.RegisterAlias("general.pprofPort", "pprofPort")
+	viper.RegisterAlias("general.enable_profiling", "enableProfiling")
+	viper.RegisterAlias("processing.analysis.enable", "enableAnalysis")
+	viper.RegisterAlias("processing.discovery.enable", "enableServiceDiscovery")
+	viper.RegisterAlias("processing.domainSuffix", "domain")
+	viper.RegisterAlias("processing.oldprocessor", "useOldProcessor")
+	viper.RegisterAlias("processing.server.enable", "enable-server")
+	viper.RegisterAlias("processing.server.address", "server-address")
+	viper.RegisterAlias("processing.server.maxReceivedMessageSize", "server-maxReceivedMessageSize")
+	viper.RegisterAlias("processing.server.maxConcurrentStreams", "server-maxConcurrentStreams")
+	viper.RegisterAlias("processing.server.disableResourceReadyCheck", "disableResourceReadyCheck")
+	viper.RegisterAlias("processing.server.auth.mtls.clientCertificate", "tlsCertFile")
+	viper.RegisterAlias("processing.server.auth.mtls.privateKey", "tlsKeyFile")
+	viper.RegisterAlias("processing.server.auth.mtls.caCertificates", "caCertFile")
+	viper.RegisterAlias("processing.server.auth.mtls.accessListFile", "accessListFile")
+	viper.RegisterAlias("processing.server.auth.insecure", "insecure")
+	viper.RegisterAlias("processing.source.kubernetes.resyncPeriod", "resyncPeriod")
+	viper.RegisterAlias("processing.source.filesystem.path", "configPath")
+	viper.RegisterAlias("validation.enable", "enable-validation")
+	viper.RegisterAlias("validation.webhookConfigFile", "validation-webhook-config-file")
+	viper.RegisterAlias("validation.webhookPort", "validation-port")
+	viper.RegisterAlias("validation.webhookName", "webhook-name")
+	viper.RegisterAlias("validation.deploymentName", "deployment-name")
+	viper.RegisterAlias("validation.deploymentNamespace", "deployment-namespace")
+	viper.RegisterAlias("validation.serviceName", "service-name")
 }

@@ -28,16 +28,16 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	mcp "istio.io/api/mcp/v1alpha1"
-	"istio.io/istio/galley/pkg/metadata/kube"
+	"istio.io/pkg/log"
+	"istio.io/pkg/probe"
+
+	"istio.io/istio/galley/pkg/config/meta/metadata"
+	schema2 "istio.io/istio/galley/pkg/config/meta/schema"
 	"istio.io/istio/mixer/pkg/config/store"
-	"istio.io/istio/pkg/env"
-	"istio.io/istio/pkg/log"
-	"istio.io/istio/pkg/mcp/client"
-	"istio.io/istio/pkg/mcp/configz"
+	configz "istio.io/istio/pkg/mcp/configz/client"
 	"istio.io/istio/pkg/mcp/creds"
 	"istio.io/istio/pkg/mcp/monitoring"
 	"istio.io/istio/pkg/mcp/sink"
-	"istio.io/istio/pkg/probe"
 )
 
 var scope = log.RegisterScope("mcp", "Mixer MCP client stack", 0)
@@ -54,7 +54,8 @@ const (
 // Do not use 'init()' for automatic registration; linker will drop
 // the whole module because it looks unused.
 func Register(builders map[string]store.Builder) {
-	var builder store.Builder = func(u *url.URL, _ *schema.GroupVersion, credOptions *creds.Options, _ []string) (store.Backend, error) {
+	var builder store.Builder = func(u *url.URL, _ *schema.GroupVersion, credOptions *creds.Options, _ []string) (
+		store.Backend, error) {
 		return newStore(u, credOptions, nil)
 	}
 
@@ -87,7 +88,7 @@ type updateHookFn func()
 // backend is StoreBackend implementation using MCP.
 type backend struct {
 	// mapping of CRD <> collections.
-	mapping *mapping
+	mapping *schema2.Mapping
 
 	// Use insecure communication for gRPC.
 	insecure bool
@@ -132,17 +133,15 @@ type state struct {
 	synced map[string]bool // by collection
 }
 
-var useMCPLegacyVar = env.RegisterBoolVar("USE_MCP_LEGACY", false, "")
-
 // Init implements store.Backend.Init.
 func (b *backend) Init(kinds []string) error {
-	m, err := constructMapping(kinds, kube.Types)
+	m, err := schema2.ConstructKindMapping(kinds, metadata.MustGet())
 	if err != nil {
 		return err
 	}
 	b.mapping = m
 
-	collections := b.mapping.collections()
+	collections := b.mapping.Collections()
 
 	scope.Infof("Requesting following collections:")
 	for i, name := range collections {
@@ -162,7 +161,7 @@ func (b *backend) Init(kinds []string) error {
 		requiredFiles := []string{b.credOptions.CertificateFile, b.credOptions.KeyFile, b.credOptions.CACertificateFile}
 		log.Infof("Secure MCP configured. Waiting for required certificate files to become available: %v", requiredFiles)
 		for len(requiredFiles) > 0 {
-			if _, err := os.Stat(requiredFiles[0]); os.IsNotExist(err) {
+			if _, err = os.Stat(requiredFiles[0]); os.IsNotExist(err) {
 				log.Infof("%v not found. Checking again in %v", requiredFiles[0], requiredCertCheckFreq)
 				select {
 				case <-ctx.Done():
@@ -179,10 +178,10 @@ func (b *backend) Init(kinds []string) error {
 			requiredFiles = requiredFiles[1:]
 		}
 
-		watcher, err := creds.WatchFiles(ctx.Done(), b.credOptions)
-		if err != nil {
+		watcher, er := creds.WatchFiles(ctx.Done(), b.credOptions)
+		if er != nil {
 			cancel()
-			return err
+			return er
 		}
 		credentials := creds.CreateForClient(address, watcher)
 		securityOption = grpc.WithTransportCredentials(credentials)
@@ -195,7 +194,7 @@ func (b *backend) Init(kinds []string) error {
 		return err
 	}
 
-	b.mcpReporter = monitoring.NewStatsContext("mixer/mcp/sink")
+	b.mcpReporter = monitoring.NewStatsContext("mixer")
 	options := &sink.Options{
 		CollectionOptions: sink.CollectionOptionsFromSlice(collections),
 		Updater:           b,
@@ -203,22 +202,10 @@ func (b *backend) Init(kinds []string) error {
 		Reporter:          b.mcpReporter,
 	}
 
-	// TODO - temporarily support both the new and old stack during transition
-	if useMCPLegacyVar.Get() {
-		log.Infof("USE_MCP_LEGACY=true - using legacy MCP client stack")
-
-		cl := mcp.NewAggregatedMeshConfigServiceClient(conn)
-		c := client.New(cl, options)
-		configz.Register(c)
-		go c.Run(ctx)
-	} else {
-		log.Infof("Using new MCP client sink stack")
-
-		cl := mcp.NewResourceSourceClient(conn)
-		c := sink.NewClient(cl, options)
-		configz.Register(c)
-		go c.Run(ctx)
-	}
+	cl := mcp.NewResourceSourceClient(conn)
+	c := sink.NewClient(cl, options)
+	configz.Register(c)
+	go c.Run(ctx)
 
 	b.state = &state{
 		items:  make(map[string]map[store.Key]*store.BackEndResource),
@@ -266,7 +253,7 @@ func (b *backend) Stop() {
 		b.cancel()
 		b.cancel = nil
 	}
-	b.mcpReporter.Close()
+	_ = b.mcpReporter.Close()
 }
 
 // Watch creates a channel to receive the events.
@@ -335,7 +322,7 @@ func (b *backend) Apply(change *sink.Change) error {
 		}
 
 		name := o.Metadata.Name
-		kind := b.mapping.kind(change.Collection)
+		kind := b.mapping.Kind(change.Collection)
 		contents := o.Body
 		labels := o.Metadata.Labels
 		annotations := o.Metadata.Annotations

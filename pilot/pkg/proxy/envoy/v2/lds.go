@@ -15,76 +15,65 @@
 package v2
 
 import (
-	"fmt"
+	"time"
 
 	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	"github.com/gogo/protobuf/types"
-	"github.com/prometheus/client_golang/prometheus"
 
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/util"
 )
 
 func (s *DiscoveryServer) pushLds(con *XdsConnection, push *model.PushContext, version string) error {
 	// TODO: Modify interface to take services, and config instead of making library query registry
+	pushStart := time.Now()
+	rawListeners := s.generateRawListeners(con, push)
 
-	rawListeners, err := s.generateRawListeners(con, push)
-	if err != nil {
-		return err
-	}
 	if s.DebugConfigs {
 		con.LDSListeners = rawListeners
 	}
-	response := ldsDiscoveryResponse(rawListeners, version)
-	err = con.send(response)
+	response := ldsDiscoveryResponse(rawListeners, version, push.Version)
+	err := con.send(response)
+	ldsPushTime.Record(time.Since(pushStart).Seconds())
 	if err != nil {
 		adsLog.Warnf("LDS: Send failure %s: %v", con.ConID, err)
-		pushes.With(prometheus.Labels{"type": "lds_senderr"}).Add(1)
+		recordSendError(ldsSendErrPushes, err)
 		return err
 	}
-	pushes.With(prometheus.Labels{"type": "lds"}).Add(1)
+	ldsPushes.Increment()
 
-	adsLog.Infof("LDS: PUSH for node:%s addr:%q listeners:%d %d", con.modelNode.ID, con.PeerAddr, len(rawListeners),
-		response.Size())
+	adsLog.Infof("LDS: PUSH for node:%s listeners:%d", con.node.ID, len(rawListeners))
 	return nil
 }
 
-func (s *DiscoveryServer) generateRawListeners(con *XdsConnection, push *model.PushContext) ([]*xdsapi.Listener, error) {
-	rawListeners, err := s.ConfigGenerator.BuildListeners(s.Env, con.modelNode, push)
-	if err != nil {
-		adsLog.Warnf("LDS: Failed to generate listeners for node %s: %v", con.modelNode.ID, err)
-		pushes.With(prometheus.Labels{"type": "lds_builderr"}).Add(1)
-		return nil, err
-	}
+func (s *DiscoveryServer) generateRawListeners(con *XdsConnection, push *model.PushContext) []*xdsapi.Listener {
+	rawListeners := s.ConfigGenerator.BuildListeners(s.Env, con.node, push)
 
 	for _, l := range rawListeners {
-		if err = l.Validate(); err != nil {
-			retErr := fmt.Errorf("LDS: Generated invalid listener for node %v: %v", con.modelNode, err)
-			adsLog.Errorf("LDS: Generated invalid listener for node %s: %v, %v", con.modelNode.ID, err, l)
-			pushes.With(prometheus.Labels{"type": "lds_builderr"}).Add(1)
+		if err := l.Validate(); err != nil {
+			adsLog.Errorf("LDS: Generated invalid listener for node:%s: %v, %v", con.node.ID, err, l)
+			ldsBuildErrPushes.Increment()
 			// Generating invalid listeners is a bug.
-			// Panic instead of trying to recover from that, since we can't
-			// assume anything about the state.
-			panic(retErr.Error())
+			// Instead of panic, which will break down the whole cluster. Just ignore it here, let envoy process it.
 		}
 	}
-	return rawListeners, nil
+	return rawListeners
 }
 
 // LdsDiscoveryResponse returns a list of listeners for the given environment and source node.
-func ldsDiscoveryResponse(ls []*xdsapi.Listener, version string) *xdsapi.DiscoveryResponse {
+func ldsDiscoveryResponse(ls []*xdsapi.Listener, version string, noncePrefix string) *xdsapi.DiscoveryResponse {
 	resp := &xdsapi.DiscoveryResponse{
 		TypeUrl:     ListenerType,
 		VersionInfo: version,
-		Nonce:       nonce(),
+		Nonce:       nonce(noncePrefix),
 	}
 	for _, ll := range ls {
 		if ll == nil {
 			adsLog.Errora("Nil listener ", ll)
-			totalXDSInternalErrors.Add(1)
+			totalXDSInternalErrors.Increment()
 			continue
 		}
-		lr, _ := types.MarshalAny(ll)
-		resp.Resources = append(resp.Resources, *lr)
+		lr := util.MessageToAny(ll)
+		resp.Resources = append(resp.Resources, lr)
 	}
 
 	return resp

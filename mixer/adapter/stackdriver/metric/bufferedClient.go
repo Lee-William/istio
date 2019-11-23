@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,11 +82,16 @@ func batchTimeSeries(series []*monitoringpb.TimeSeries, tsLimit int) [][]*monito
 	return batches
 }
 
-func (b *buffered) start(env adapter.Env, ticker *time.Ticker) {
+func (b *buffered) start(env adapter.Env, ticker *time.Ticker, quit chan struct{}) {
 	env.ScheduleDaemon(func() {
-		for range ticker.C {
-			b.mergeTimeSeries()
-			b.Send()
+		for {
+			select {
+			case <-ticker.C:
+				b.mergeTimeSeries()
+				b.Send()
+			case <-quit:
+				return
+			}
 		}
 	})
 }
@@ -161,7 +167,12 @@ func (b *buffered) Send() {
 		if err != nil {
 			ets := handleError(err, timeSeries)
 			b.updateRetryBuffer(ets)
-			_ = b.l.Errorf("Stackdriver returned: %v\nGiven data: %v", err, timeSeries)
+			b.l.Errorf("%d time series was sent and Stackdriver returned: %v\n", len(timeSeries), err) // nolint: errcheck
+			if isOutOfOrderError(err) {
+				b.l.Debugf("Given data: %v", timeSeries)
+			} else {
+				b.l.Errorf("Given data: %v", timeSeries) // nolint: errcheck
+			}
 		} else {
 			b.l.Debugf("Successfully sent data to Stackdriver.")
 		}
@@ -180,7 +191,7 @@ func (b *buffered) Close() error {
 }
 
 // handleError extract out timeseries that fails to create from response status.
-// If no sepecific timeseries listed in error response, retry all time series in batch.
+// If no specific timeseries listed in error response, retry all time series in batch.
 func handleError(err error, tsSent []*monitoringpb.TimeSeries) []*monitoringpb.TimeSeries {
 	errorTS := make([]*monitoringpb.TimeSeries, 0)
 	retryAll := true
@@ -230,6 +241,15 @@ func isRetryable(c codes.Code) bool {
 	switch c {
 	case codes.Canceled, codes.DeadlineExceeded, codes.ResourceExhausted, codes.Aborted, codes.Internal, codes.Unavailable:
 		return true
+	}
+	return false
+}
+
+func isOutOfOrderError(err error) bool {
+	if s, ok := status.FromError(err); ok {
+		if strings.Contains(strings.ToLower(s.Message()), "order") {
+			return true
+		}
 	}
 	return false
 }

@@ -26,12 +26,12 @@ import (
 	"github.com/gogo/protobuf/types"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
+
 	mixerEnv "istio.io/istio/mixer/test/client/env"
 	"istio.io/istio/pilot/pkg/bootstrap"
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/proxy/envoy"
 	"istio.io/istio/pilot/pkg/serviceregistry"
-	agent "istio.io/istio/pkg/bootstrap"
+	envoyBootstrap "istio.io/istio/pkg/bootstrap"
+	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/keepalive"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/tests/util"
@@ -112,17 +112,22 @@ func startMixer() error {
 }
 
 func startEnvoy() error {
-	cfg := &meshconfig.ProxyConfig{
-		DiscoveryAddress: "localhost:8080",
-		ConfigPath:       env.IstioOut,
-		BinaryPath:       env.IstioBin + "/envoy",
-		ServiceCluster:   "test",
-		CustomConfigFile: env.IstioSrc + "/tools/deb/envoy_bootstrap_v2.json",
-		ConnectTimeout:   types.DurationProto(5 * time.Second),  // crash if not set
-		DrainDuration:    types.DurationProto(30 * time.Second), // crash if 0
-		StatNameLength:   189,
+	cfg := envoyBootstrap.Config{
+		Node:           "sidecar~127.0.0.2~a~a",
+		DNSRefreshRate: "60s",
+		LocalEnv:       os.Environ(),
+		Proxy: &meshconfig.ProxyConfig{
+			DiscoveryAddress: "localhost:8080",
+			ConfigPath:       env.IstioOut,
+			BinaryPath:       env.IstioBin + "/envoy",
+			ServiceCluster:   "test",
+			CustomConfigFile: env.IstioSrc + "/tools/packaging/common/envoy_bootstrap_v2.json",
+			ConnectTimeout:   types.DurationProto(5 * time.Second),  // crash if not set
+			DrainDuration:    types.DurationProto(30 * time.Second), // crash if 0
+			StatNameLength:   189,
+		},
 	}
-	cfgF, err := agent.WriteBootstrap(cfg, "sidecar~127.0.0.2~a~a", 1, []string{}, nil, os.Environ(), []string{})
+	cfgF, err := envoyBootstrap.New(cfg).CreateFileForEpoch(1)
 	if err != nil {
 		return err
 	}
@@ -131,7 +136,7 @@ func startEnvoy() error {
 	if err != nil {
 		envoyLog = os.Stderr
 	}
-	_, err = agent.RunProxy(cfg, "node", 1, cfgF, stop, envoyLog, envoyLog, []string{
+	_, err = envoyBootstrap.RunProxy(cfg.Proxy, "node", 1, cfgF, stop, envoyLog, envoyLog, []string{
 		"--disable-hot-restart", // "-l", "trace",
 	})
 	return err
@@ -147,26 +152,24 @@ func startEnvoy() error {
 func startPilot() error {
 	stop := make(chan struct{})
 
-	mcfg := model.DefaultMeshConfig()
+	mcfg := mesh.DefaultMeshConfig()
 	mcfg.ProxyHttpPort = 15002
 
 	// Create a test pilot discovery service configured to watch the tempDir.
 	args := bootstrap.PilotArgs{
 		Namespace: "testing",
-		DiscoveryOptions: envoy.DiscoveryServiceOptions{
+		DiscoveryOptions: bootstrap.DiscoveryServiceOptions{
 			HTTPAddr:        ":15007",
 			GrpcAddr:        ":15010",
 			SecureGrpcAddr:  ":15011",
-			EnableCaching:   true,
 			EnableProfiling: true,
 		},
 
 		Mesh: bootstrap.MeshArgs{
-			MixerAddress:    "localhost:9091",
-			RdsRefreshDelay: types.DurationProto(10 * time.Millisecond),
+			MixerAddress: "localhost:9091",
 		},
 		Config: bootstrap.ConfigArgs{
-			KubeConfig: env.IstioSrc + "/.circleci/config",
+			KubeConfig: env.IstioSrc + "/tests/util/kubeconfig",
 		},
 		Service: bootstrap.ServiceArgs{
 			// Using the Mock service registry, which provides the hello and world services.
